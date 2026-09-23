@@ -271,9 +271,30 @@ impl Savepoint<'_> {
         Savepoint::new_(conn)
     }
 
+    /// Begin a savepoint using a shared connection reference.
+    ///
+    /// Unlike [`Savepoint::new`], this cannot prevent overlapping savepoints
+    /// at compile time. Use the mutable variant when possible.
+    #[inline]
+    pub fn new_unchecked(conn: &Connection) -> Result<Savepoint<'_>> {
+        Savepoint::new_(conn)
+    }
+
     /// Begin a new savepoint with a user-provided savepoint name.
     #[inline]
     pub fn with_name<T: Into<String>>(conn: &mut Connection, name: T) -> Result<Savepoint<'_>> {
+        Savepoint::with_name_(conn, name)
+    }
+
+    /// Begin a named savepoint using a shared connection reference.
+    ///
+    /// Unlike [`Savepoint::with_name`], this cannot prevent overlapping
+    /// savepoints at compile time. Use the mutable variant when possible.
+    #[inline]
+    pub fn with_name_unchecked<T: Into<String>>(
+        conn: &Connection,
+        name: T,
+    ) -> Result<Savepoint<'_>> {
         Savepoint::with_name_(conn, name)
     }
 
@@ -509,6 +530,16 @@ impl Connection {
         Savepoint::new(self)
     }
 
+    /// Begin a savepoint using a shared reference to this connection.
+    ///
+    /// Unlike [`Connection::savepoint`], this cannot prevent overlapping
+    /// savepoints at compile time. SQLite allows nested savepoints, but callers
+    /// must finish them in reverse order.
+    #[inline]
+    pub fn unchecked_savepoint(&self) -> Result<Savepoint<'_>> {
+        Savepoint::new_unchecked(self)
+    }
+
     /// Begin a new savepoint with a specified name.
     ///
     /// See [`savepoint`](Connection::savepoint).
@@ -519,6 +550,15 @@ impl Connection {
     #[inline]
     pub fn savepoint_with_name<T: Into<String>>(&mut self, name: T) -> Result<Savepoint<'_>> {
         Savepoint::with_name(self, name)
+    }
+
+    /// Begin a named savepoint using a shared reference to this connection.
+    ///
+    /// Like [`Connection::unchecked_savepoint`], callers must finish
+    /// overlapping savepoints in reverse order.
+    #[inline]
+    pub fn unchecked_savepoint_with_name<T: Into<String>>(&self, name: T) -> Result<Savepoint<'_>> {
+        Savepoint::with_name_unchecked(self, name)
     }
 
     /// Determine the transaction state of a database
@@ -775,6 +815,33 @@ mod test {
             sp1.commit()?;
         }
         assert_current_sum(8, &db)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_unchecked_savepoint() -> Result<()> {
+        let db = checked_memory_handle()?;
+        {
+            let sp = db.unchecked_savepoint()?;
+            insert(1, &sp)?;
+            {
+                let nested = db.unchecked_savepoint_with_name("nested")?;
+                insert(2, &nested)?;
+            }
+            assert_current_sum(1, &sp)?;
+            sp.commit()?;
+        }
+        assert_current_sum(1, &db)?;
+
+        {
+            let mut sp = db.unchecked_savepoint()?;
+            insert(4, &sp)?;
+            sp.rollback()?;
+            insert(8, &sp)?;
+            sp.finish()?;
+        }
+        assert_current_sum(1, &db)?;
+        assert!(db.is_autocommit());
         Ok(())
     }
 

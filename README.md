@@ -159,7 +159,7 @@ You can adjust this behavior in a number of ways:
 * If you use the `bundled`, `bundled-sqlcipher`, or `bundled-sqlcipher-vendored-openssl` features, `libsqlite3-sys` will use the
   [cc](https://crates.io/crates/cc) crate to compile SQLite or SQLCipher from source and
   link against that. This source is embedded in the `libsqlite3-sys` crate and
-  is currently SQLite 3.53.2 (as of `rusqlite` 0.40.1 / `libsqlite3-sys`
+  is currently SQLite 3.53.4 (as of `rusqlite` 0.40.1 / `libsqlite3-sys`
   0.38.1).  This is probably the simplest solution to any build problems. You can enable this by adding the following in your `Cargo.toml` file:
   ```toml
   [dependencies.rusqlite]
