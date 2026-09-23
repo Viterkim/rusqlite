@@ -429,7 +429,7 @@ impl Connection {
     /// is disabled.
     ///
     /// If the progress callback returns `true`, the operation is interrupted.
-    pub fn progress_handler<F>(&mut self, num_ops: c_int, handler: Option<F>) -> Result<()>
+    pub fn progress_handler<F>(&self, num_ops: c_int, handler: Option<F>) -> Result<()>
     where
         F: FnMut() -> bool + Send + 'static,
     {
@@ -439,7 +439,7 @@ impl Connection {
     /// Register an authorizer callback that's invoked
     /// as a statement is being prepared.
     #[inline]
-    pub fn authorizer<F>(&mut self, hook: Option<F>) -> Result<()>
+    pub fn authorizer<F>(&self, hook: Option<F>) -> Result<()>
     where
         F: for<'r> FnMut(AuthContext<'r>) -> Authorization + Send + 'static,
     {

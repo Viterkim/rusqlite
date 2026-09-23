@@ -327,13 +327,13 @@
 
 - [X] `sqlite3session_create`
 - [X] `sqlite3session_delete`
-- [ ] `sqlite3session_object_config`
+- [ ] `sqlite3session_object_config` (`SQLITE_SESSION_OBJCONFIG_SIZE` supported)
 - [X] `sqlite3session_enable`
 - [X] `sqlite3session_indirect`
 - [X] `sqlite3session_attach`
 - [X] `sqlite3session_table_filter` (Boxed callback, reference kept)
 - [X] `sqlite3session_changeset`
-- [ ] `sqlite3session_changeset_size`
+- [X] `sqlite3session_changeset_size`
 - [X] `sqlite3session_diff`
 - [X] `sqlite3session_patchset`
 - [X] `sqlite3session_isempty`
@@ -358,13 +358,13 @@
 - [X] `sqlite3changegroup_output`
 - [X] `sqlite3changegroup_delete`
 - [X] `sqlite3changeset_apply`
-- [ ] `sqlite3changeset_apply_v2`
-- [ ] `sqlite3rebaser_create`
-- [ ] `sqlite3rebaser_configure`
-- [ ] `sqlite3rebaser_rebase`
-- [ ] `sqlite3rebaser_delete`
+- [X] `sqlite3changeset_apply_v2`
+- [X] `sqlite3rebaser_create`
+- [X] `sqlite3rebaser_configure`
+- [X] `sqlite3rebaser_rebase`
+- [X] `sqlite3rebaser_delete`
 - [X] `sqlite3changeset_apply_strm`
-- [ ] `sqlite3changeset_apply_v2_strm`
+- [X] `sqlite3changeset_apply_v2_strm`
 - [X] `sqlite3changeset_concat_strm`
 - [X] `sqlite3changeset_invert_strm`
 - [X] `sqlite3changeset_start_strm`
@@ -372,9 +372,8 @@
 - [X] `sqlite3session_changeset_strm`
 - [X] `sqlite3session_patchset_strm`
 - [X] `sqlite3changegroup_add_strm`
-- [X] `sqlite3changegroup_add_strm`
 - [X] `sqlite3changegroup_output_strm`
-- [ ] `sqlite3rebaser_rebase_strm`
+- [X] `sqlite3rebaser_rebase_strm`
 - [ ] `sqlite3session_config`
 
 ## List of virtual table methods supported
