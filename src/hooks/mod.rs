@@ -433,7 +433,7 @@ impl Connection {
     /// is disabled.
     ///
     /// If the progress callback returns `true`, the operation is interrupted.
-    pub fn progress_handler<F>(&mut self, num_ops: c_int, handler: Option<F>) -> Result<()>
+    pub fn progress_handler<F>(&self, num_ops: c_int, handler: Option<F>) -> Result<()>
     where
         F: FnMut() -> bool + Send + 'static,
     {
@@ -443,7 +443,7 @@ impl Connection {
     /// Register an authorizer callback that's invoked
     /// as a statement is being prepared.
     #[inline]
-    pub fn authorizer<F>(&mut self, hook: Option<F>) -> Result<()>
+    pub fn authorizer<F>(&self, hook: Option<F>) -> Result<()>
     where
         F: for<'r> FnMut(AuthContext<'r>) -> Authorization + Send + 'static,
     {
@@ -816,7 +816,7 @@ mod test {
 
     #[test]
     fn test_progress_handler() -> Result<()> {
-        let mut db = Connection::open_in_memory()?;
+        let db = Connection::open_in_memory()?;
 
         static CALLED: AtomicBool = AtomicBool::new(false);
         db.progress_handler(
@@ -833,7 +833,7 @@ mod test {
 
     #[test]
     fn test_progress_handler_interrupt() -> Result<()> {
-        let mut db = Connection::open_in_memory()?;
+        let db = Connection::open_in_memory()?;
 
         fn handler() -> bool {
             true
@@ -849,7 +849,7 @@ mod test {
     fn test_authorizer() -> Result<()> {
         use super::{AuthAction, AuthContext, Authorization};
 
-        let mut db = Connection::open_in_memory()?;
+        let db = Connection::open_in_memory()?;
         db.execute_batch("CREATE TABLE foo (public TEXT, private TEXT)")?;
 
         let authorizer = move |ctx: AuthContext<'_>| match ctx.action {
