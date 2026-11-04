@@ -77,7 +77,7 @@ Filtered applies use an outer savepoint to undo earlier changes when the filter 
 
 A panicking `Session::table_filter` permanently invalidates capture. Changeset and patchset extraction return `Error::SessionCaptureFailure`, including after replacing or removing the filter. Call `Session::check_capture` before using `is_empty` to skip extraction. Create a new session after capture fails.
 
-Reentrant capture filter replacement is rejected by invalidating capture. Dropping a session from its running capture filter retains its native session and callback allocation to avoid freeing memory SQLite is still using.
+Reentrant capture filter replacement is rejected by invalidating capture. Dropping a session from its running capture filter intentionally leaks its native session and callback allocation, keeping SQLite's active memory alive.
 
 ### V2 apply flags
 
@@ -139,6 +139,8 @@ Code matching the old conversion variants from `Row::get` should inspect `Column
 
 `Row::get_blob` and `get_text` borrow bytes or UTF-8 text without copying, while retaining the same column conversion context. Numeric parameter indices are checked before conversion to SQLite's integer type. SQLite error code accessors also cover `SqlInputError`.
 
+Oversized column, database, and virtual table constraint indices cannot wrap around to another index. Blob seeks reject offsets that would overflow the old position calculation.
+
 ### Session callbacks and owned rows
 
 Streaming operations retain their original I/O errors in `Error::SessionIoFailure`, including failures encountered after starting a streaming iterator. The SQLite error code is retained too.
@@ -176,3 +178,15 @@ With the `codec` feature, `Connection::set_key` and `rekey` provide distinct met
 `Backup::run_to_completion_with` accepts a borrowed `FnMut` callback returning any error type. The callback receives `StepResult` and progress, so it can cancel or stop retrying busy databases. `BackupError<E>` retains callback errors unchanged. The callback also runs after `Done`, when the backup has already completed. Nonpositive page counts return an error from both completion helpers.
 
 `run_to_completion_checked` adds a fallible check before the first and every subsequent step, with progress reporting afterward. This supports cancellation before copying any more pages.
+
+## Schema and connection metadata
+
+`Connection::table_columns(schema, table)` returns `TableColumn` records, including generated and hidden columns, primary key ordering, and default expressions as SQL text. Names are bound as parameters. This covers [#991](https://github.com/rusqlite/rusqlite/issues/991).
+
+`set_last_insert_rowid` exposes SQLite's connection metadata setter requested in [#1757](https://github.com/rusqlite/rusqlite/issues/1757). `system_errno` exposes the OS error number for an open connection's latest I/O failure, requested in [#458](https://github.com/rusqlite/rusqlite/issues/458).
+
+## Deserialization safety
+
+With `serialize`, reader buffers are initialized before a safe Rust reader receives them. Read failures retain their original `io::Error` in `Error::DeserializationReadFailure`. Invalid schemas and sizes are checked before transferring buffer ownership, fixing an allocation leak.
+
+Deserialization buffers include initialized padding for malformed input, as [SQLite recommends](https://sqlite.org/c3ref/deserialize.html). `deserialize_bytes` now copies its input into that owned buffer and accepts an ordinary borrowed slice instead of requiring a static slice.

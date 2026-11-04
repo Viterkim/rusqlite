@@ -89,6 +89,10 @@ pub enum Error {
     /// An operation failed and finishing its statement failed too.
     StatementCompletionFailure(Box<StatementCompletionError>),
 
+    /// Reading serialized database bytes failed.
+    #[cfg(feature = "serialize")]
+    DeserializationReadFailure(std::io::Error),
+
     /// A session streaming callback failed with its original I/O error.
     #[cfg(feature = "session")]
     SessionIoFailure(ffi::Error, std::io::Error),
@@ -323,6 +327,10 @@ impl fmt::Display for Error {
             Self::ColumnConversionFailure(ref error) => error.fmt(f),
             Self::ValueConversionFailure(ref error) => error.fmt(f),
             Self::StatementCompletionFailure(ref error) => error.fmt(f),
+            #[cfg(feature = "serialize")]
+            Self::DeserializationReadFailure(ref source) => {
+                write!(f, "Could not read serialized database: {source}")
+            }
             #[cfg(feature = "session")]
             Self::SessionCaptureFailure => write!(
                 f,
@@ -430,6 +438,8 @@ impl error::Error for Error {
             Self::ColumnConversionFailure(ref error) => Some(&**error),
             Self::ValueConversionFailure(ref error) => Some(error),
             Self::StatementCompletionFailure(ref error) => Some(&**error),
+            #[cfg(feature = "serialize")]
+            Self::DeserializationReadFailure(ref source) => Some(source),
             #[cfg(feature = "session")]
             Self::SessionCaptureFailure => None,
             #[cfg(feature = "session")]

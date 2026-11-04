@@ -93,6 +93,7 @@ pub use crate::cache::CachedStatement;
 pub use crate::column::Column;
 #[cfg(feature = "column_metadata")]
 pub use crate::column::ColumnMetadata;
+pub use crate::column::TableColumn;
 pub use crate::error::{Error, StatementCompletionError, to_sqlite_error};
 pub use crate::ffi::ErrorCode;
 #[cfg(feature = "load_extension")]
@@ -694,6 +695,20 @@ impl Connection {
         self.db.borrow_mut().last_insert_rowid()
     }
 
+    /// Set the value returned by [`Connection::last_insert_rowid`].
+    ///
+    /// This changes connection metadata, without inserting a row or changing a table.
+    pub fn set_last_insert_rowid(&self, rowid: i64) {
+        unsafe { ffi::sqlite3_set_last_insert_rowid(self.db.borrow().db, rowid) }
+    }
+
+    /// Return the OS error number associated with SQLite's most recent I/O failure.
+    ///
+    /// The number is platform dependent and may be zero when no OS error is available.
+    pub fn system_errno(&self) -> c_int {
+        unsafe { ffi::sqlite3_system_errno(self.db.borrow().db) }
+    }
+
     /// Convenience method to execute a query that is expected to return a
     /// single row.
     ///
@@ -1136,9 +1151,11 @@ impl Connection {
     ///
     /// Return an `Error::InvalidDatabaseIndex` if `index` is out of range.
     pub fn db_name(&self, index: usize) -> Result<String> {
+        let native_index =
+            c_int::try_from(index).map_err(|_| Error::InvalidDatabaseIndex(index))?;
         unsafe {
             let db = self.handle();
-            let name = ffi::sqlite3_db_name(db, index as c_int);
+            let name = ffi::sqlite3_db_name(db, native_index);
             if name.is_null() {
                 Err(Error::InvalidDatabaseIndex(index))
             } else {

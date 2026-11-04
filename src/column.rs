@@ -5,6 +5,26 @@ use std::str;
 use crate::ffi;
 use crate::{Connection, Error, Name, Result, Statement};
 
+/// Schema information for a table or view column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableColumn {
+    /// Column rank in the current pragma result.
+    pub cid: i64,
+    /// Column name.
+    pub name: String,
+    /// Declared SQL type, or an empty string when no type was declared.
+    pub decl_type: String,
+    /// Whether SQLite marks the column NOT NULL.
+    pub not_null: bool,
+    /// Default SQL expression, without evaluating it. `None` means no default.
+    pub default_value: Option<String>,
+    /// One-based position in the primary key, or zero for non-key columns.
+    pub primary_key_position: i64,
+    /// SQLite's hidden flag: 0 for normal, 1 for hidden, 2 for virtual generated,
+    /// and 3 for stored generated columns.
+    pub hidden: i64,
+}
+
 /// Information about a column of a SQLite query.
 #[cfg(feature = "column_decltype")]
 #[derive(Debug)]
@@ -268,6 +288,30 @@ impl Statement<'_> {
 }
 
 impl Connection {
+    /// Read all columns of a table or view, including generated and hidden columns.
+    ///
+    /// `schema` defaults to `main`. A missing table returns an empty vector.
+    /// Names are bound as values, so they can contain quotes and other SQL syntax.
+    pub fn table_columns(&self, schema: Option<&str>, table: &str) -> Result<Vec<TableColumn>> {
+        let mut stmt = self.prepare(
+            "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden \
+             FROM pragma_table_xinfo(?1, ?2) ORDER BY cid",
+        )?;
+
+        stmt.query_map((table, schema.unwrap_or("main")), |row| {
+            Ok(TableColumn {
+                cid: row.get(0)?,
+                name: row.get(1)?,
+                decl_type: row.get(2)?,
+                not_null: row.get(3)?,
+                default_value: row.get(4)?,
+                primary_key_position: row.get(5)?,
+                hidden: row.get(6)?,
+            })
+        })?
+        .collect()
+    }
+
     /// Check if `table_name`.`column_name` exists.
     ///
     /// `db_name` is main, temp, the name in ATTACH, or `None` to search all databases.

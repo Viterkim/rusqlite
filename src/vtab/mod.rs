@@ -562,6 +562,7 @@ impl IndexInfo {
 
     /// Determine the collation for a virtual table constraint
     pub fn collation(&self, constraint_idx: usize) -> Result<&str> {
+        self.check_constraint_index(constraint_idx)?;
         let idx = constraint_idx as c_int;
         let collation = unsafe { ffi::sqlite3_vtab_collation(self.0, idx) };
         if collation.is_null() {
@@ -584,6 +585,7 @@ impl IndexInfo {
 
     /// Constraint value
     pub fn rhs_value(&self, constraint_idx: usize) -> Result<Option<ValueRef<'_>>> {
+        self.check_constraint_index(constraint_idx)?;
         let idx = constraint_idx as c_int;
         let mut p_value: *mut sqlite3_value = ptr::null_mut();
         let rc = unsafe { ffi::sqlite3_vtab_rhs_value(self.0, idx, &raw mut p_value) };

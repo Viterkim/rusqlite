@@ -74,8 +74,9 @@ impl RawStatement {
     #[inline]
     #[cfg(feature = "column_metadata")]
     pub fn column_database_name(&self, idx: usize) -> Option<&CStr> {
+        let idx = c_int::try_from(idx).ok()?;
         unsafe {
-            let db_name = ffi::sqlite3_column_database_name(self.ptr, idx as c_int);
+            let db_name = ffi::sqlite3_column_database_name(self.ptr, idx);
             if db_name.is_null() {
                 None
             } else {
@@ -87,8 +88,9 @@ impl RawStatement {
     #[inline]
     #[cfg(feature = "column_metadata")]
     pub fn column_table_name(&self, idx: usize) -> Option<&CStr> {
+        let idx = c_int::try_from(idx).ok()?;
         unsafe {
-            let tbl_name = ffi::sqlite3_column_table_name(self.ptr, idx as c_int);
+            let tbl_name = ffi::sqlite3_column_table_name(self.ptr, idx);
             if tbl_name.is_null() {
                 None
             } else {
@@ -100,8 +102,9 @@ impl RawStatement {
     #[inline]
     #[cfg(feature = "column_metadata")]
     pub fn column_origin_name(&self, idx: usize) -> Option<&CStr> {
+        let idx = c_int::try_from(idx).ok()?;
         unsafe {
-            let origin_name = ffi::sqlite3_column_origin_name(self.ptr, idx as c_int);
+            let origin_name = ffi::sqlite3_column_origin_name(self.ptr, idx);
             if origin_name.is_null() {
                 None
             } else {
@@ -113,8 +116,9 @@ impl RawStatement {
     #[inline]
     #[cfg(feature = "column_decltype")]
     pub fn column_decltype(&self, idx: usize) -> Option<&CStr> {
+        let idx = c_int::try_from(idx).ok()?;
         unsafe {
-            let decltype = ffi::sqlite3_column_decltype(self.ptr, idx as c_int);
+            let decltype = ffi::sqlite3_column_decltype(self.ptr, idx);
             if decltype.is_null() {
                 None
             } else {
@@ -125,8 +129,8 @@ impl RawStatement {
 
     #[inline]
     pub fn column_name(&self, idx: usize) -> Option<&CStr> {
-        let idx = idx as c_int;
-        if idx < 0 || idx >= self.column_count() as c_int {
+        let idx = c_int::try_from(idx).ok()?;
+        if idx >= self.column_count() as c_int {
             return None;
         }
         unsafe {

@@ -1,4 +1,5 @@
 //! Serialize a database.
+use std::ffi::CStr;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
@@ -6,6 +7,9 @@ use std::ptr::NonNull;
 use crate::error::{error_from_handle, error_from_sqlite_code};
 use crate::ffi;
 use crate::{Connection, Error, Name, Result};
+
+// SQLite recommends 20 bytes of padding after untrusted serialized input.
+const DESERIALIZE_PADDING: usize = 20;
 
 /// Shared (`SQLITE_SERIALIZE_NOCOPY`) serialized database
 pub struct SharedData<'conn> {
@@ -18,19 +22,57 @@ pub struct SharedData<'conn> {
 pub struct OwnedData {
     ptr: NonNull<u8>,
     sz: usize,
+    capacity: usize,
 }
 
 impl OwnedData {
     /// # Safety
     ///
-    /// Caller must be certain that `ptr` is allocated by `sqlite3_malloc64`.
+    /// `ptr` must uniquely own an allocation from `sqlite3_malloc64` containing
+    /// at least `sz` initialized bytes. `sz` must not exceed `isize::MAX`.
     #[must_use]
     pub unsafe fn from_raw_nonnull(ptr: NonNull<u8>, sz: usize) -> Self {
-        Self { ptr, sz }
+        Self {
+            ptr,
+            sz,
+            capacity: sz,
+        }
     }
 
-    fn into_raw(self) -> (*mut u8, usize) {
-        let raw = (self.ptr.as_ptr(), self.sz);
+    fn zeroed(sz: usize) -> Result<Self> {
+        let capacity = padded_size(sz)?;
+        let ptr = NonNull::new(unsafe { ffi::sqlite3_malloc64(capacity as u64) }.cast::<u8>())
+            .ok_or_else(|| error_from_sqlite_code(ffi::SQLITE_NOMEM, None))?;
+
+        // The fresh allocation contains capacity bytes, initialized before any Rust slice is formed.
+        unsafe { ptr.as_ptr().write_bytes(0, capacity) };
+        Ok(Self { ptr, sz, capacity })
+    }
+
+    fn ensure_padding(&mut self) -> Result<()> {
+        let capacity = padded_size(self.sz)?;
+        if self.capacity < capacity {
+            // This pointer uniquely owns its allocation. Failed realloc leaves the original valid.
+            let ptr = NonNull::new(unsafe {
+                ffi::sqlite3_realloc64(self.ptr.as_ptr().cast(), capacity as u64).cast::<u8>()
+            })
+            .ok_or_else(|| error_from_sqlite_code(ffi::SQLITE_NOMEM, None))?;
+            self.ptr = ptr;
+            self.capacity = capacity;
+        }
+
+        // Padding fits in the allocation after the visible data bytes.
+        unsafe {
+            self.ptr
+                .as_ptr()
+                .add(self.sz)
+                .write_bytes(0, DESERIALIZE_PADDING);
+        }
+        Ok(())
+    }
+
+    fn into_raw(self) -> *mut u8 {
+        let raw = self.ptr.as_ptr();
         std::mem::forget(self);
         raw
     }
@@ -108,7 +150,7 @@ impl Connection {
     pub fn serialize<N: Name>(&mut self, schema: N) -> Result<Data<'_>> {
         let schema = schema.as_cstr()?;
         let mut sz = 0;
-        let mut ptr: *mut u8 = unsafe {
+        let ptr: *mut u8 = unsafe {
             ffi::sqlite3_serialize(
                 self.handle(),
                 schema.as_ptr(),
@@ -116,22 +158,27 @@ impl Connection {
                 ffi::SQLITE_SERIALIZE_NOCOPY,
             )
         };
-        Ok(if ptr.is_null() {
-            ptr = unsafe { ffi::sqlite3_serialize(self.handle(), schema.as_ptr(), &raw mut sz, 0) };
-            if ptr.is_null() {
-                return Err(unsafe { error_from_handle(self.handle(), ffi::SQLITE_NOMEM) });
-            }
-            Data::Owned(OwnedData {
-                ptr: NonNull::new(ptr).unwrap(),
-                sz: sz.try_into().unwrap(),
-            })
-        } else {
-            // shared buffer
+        Ok(if let Some(ptr) = NonNull::new(ptr) {
             Data::Shared(SharedData {
-                ptr: NonNull::new(ptr).unwrap(),
-                sz: sz.try_into().unwrap(),
+                ptr,
+                sz: serialized_size(sz)?,
                 phantom: PhantomData,
             })
+        } else {
+            let ptr =
+                unsafe { ffi::sqlite3_serialize(self.handle(), schema.as_ptr(), &raw mut sz, 0) };
+            let ptr = NonNull::new(ptr)
+                .ok_or_else(|| unsafe { error_from_handle(self.handle(), ffi::SQLITE_NOMEM) })?;
+            // Own the allocation while validating SQLite's reported size.
+            let mut data = OwnedData {
+                ptr,
+                sz: 0,
+                capacity: 0,
+            };
+            data.sz = serialized_size(sz)?;
+            data.capacity = data.sz;
+
+            Data::Owned(data)
         })
     }
 
@@ -143,50 +190,45 @@ impl Connection {
         sz: usize,
         read_only: bool,
     ) -> Result<()> {
-        let ptr = unsafe { ffi::sqlite3_malloc64(sz.try_into().unwrap()) }.cast::<u8>();
-        if ptr.is_null() {
-            return Err(error_from_sqlite_code(ffi::SQLITE_NOMEM, None));
-        }
-        let ptr = NonNull::new(ptr).unwrap();
-        let mut data = unsafe { OwnedData::from_raw_nonnull(ptr, sz) };
-        read.read_exact(data.deref_mut()).map_err(|e| {
-            Error::SqliteFailure(
-                ffi::Error {
-                    code: ffi::ErrorCode::CannotOpen,
-                    extended_code: ffi::SQLITE_IOERR,
-                },
-                Some(format!("{e}")),
-            )
-        })?;
-        self.deserialize(schema, data, read_only)
+        let schema = schema.as_cstr()?;
+        let mut data = OwnedData::zeroed(sz)?;
+        read.read_exact(data.deref_mut())
+            .map_err(Error::DeserializationReadFailure)?;
+
+        self.deserialize(&*schema, data, read_only)
     }
 
-    /// Deserialize `include_bytes` as a read only database
-    pub fn deserialize_bytes<N: Name>(&mut self, schema: N, data: &'static [u8]) -> Result<()> {
-        let sz = data.len().try_into().unwrap();
-        self.deserialize_(
-            schema,
-            data.as_ptr().cast_mut(),
-            sz,
-            ffi::SQLITE_DESERIALIZE_READONLY,
-        )
+    /// Copy serialized bytes into a read only database.
+    ///
+    /// The copy includes initialized padding that SQLite may read after malformed input.
+    pub fn deserialize_bytes<N: Name>(&mut self, schema: N, data: &[u8]) -> Result<()> {
+        let schema = schema.as_cstr()?;
+        let mut owned = OwnedData::zeroed(data.len())?;
+        owned.copy_from_slice(data);
+
+        self.deserialize(&*schema, owned, true)
     }
 
     /// Deserialize a database.
     pub fn deserialize<N: Name>(
         &mut self,
         schema: N,
-        data: OwnedData,
+        mut data: OwnedData,
         read_only: bool,
     ) -> Result<()> {
-        let (data, sz) = data.into_raw();
-        let sz = sz.try_into().unwrap();
+        let schema = schema.as_cstr()?;
+        let sz = deserialize_size(data.sz)?;
+        data.ensure_padding()?;
+        let capacity = deserialize_size(data.capacity)?;
         let flags = if read_only {
             ffi::SQLITE_DESERIALIZE_FREEONCLOSE | ffi::SQLITE_DESERIALIZE_READONLY
         } else {
             ffi::SQLITE_DESERIALIZE_FREEONCLOSE | ffi::SQLITE_DESERIALIZE_RESIZEABLE
         };
-        self.deserialize_(schema, data, sz, flags)
+
+        // FREEONCLOSE transfers ownership to SQLite, including when the native call fails.
+        let data = data.into_raw();
+        self.deserialize_(&schema, data, sz, capacity, flags)
         /* TODO
         if let Some(mxSize) = mxSize {
             unsafe {
@@ -200,22 +242,60 @@ impl Connection {
         }*/
     }
 
-    fn deserialize_<N: Name>(
+    fn deserialize_(
         &mut self,
-        schema: N,
+        schema: &CStr,
         data: *mut u8,
         sz: ffi::sqlite_int64,
+        capacity: ffi::sqlite_int64,
         flags: std::ffi::c_uint,
     ) -> Result<()> {
-        let schema = schema.as_cstr()?;
         let rc = unsafe {
-            ffi::sqlite3_deserialize(self.handle(), schema.as_ptr(), data, sz, sz, flags)
+            ffi::sqlite3_deserialize(self.handle(), schema.as_ptr(), data, sz, capacity, flags)
         };
         if rc != ffi::SQLITE_OK {
             return Err(unsafe { error_from_handle(self.handle(), rc) });
         }
         Ok(())
     }
+}
+
+fn serialized_size(sz: ffi::sqlite_int64) -> Result<usize> {
+    let size = usize::try_from(sz).map_err(|_| {
+        err!(
+            ffi::SQLITE_TOOBIG,
+            "Serialized database size {sz} exceeds the slice size limit"
+        )
+    })?;
+    deserialize_size(size)?;
+    Ok(size)
+}
+
+fn padded_size(sz: usize) -> Result<usize> {
+    let capacity = sz.checked_add(DESERIALIZE_PADDING).ok_or_else(|| {
+        err!(
+            ffi::SQLITE_TOOBIG,
+            "Serialized database size {sz} leaves no room for padding"
+        )
+    })?;
+    deserialize_size(capacity)?;
+    Ok(capacity)
+}
+
+fn deserialize_size(sz: usize) -> Result<ffi::sqlite_int64> {
+    if sz > isize::MAX as usize {
+        return Err(err!(
+            ffi::SQLITE_TOOBIG,
+            "Serialized database size {sz} exceeds the slice size limit"
+        ));
+    }
+
+    ffi::sqlite_int64::try_from(sz).map_err(|_| {
+        err!(
+            ffi::SQLITE_TOOBIG,
+            "Serialized database size {sz} exceeds SQLite's size limit"
+        )
+    })
 }
 
 #[cfg(all(test, not(miri)))]
@@ -258,15 +338,8 @@ mod test {
         let mut dst = Connection::open_in_memory()?;
         let read = b"";
         assert_matches!(
-            dst.deserialize_read_exact(MAIN_DB, &read[..], 1024, true)
-                .unwrap_err(),
-            Error::SqliteFailure(
-                ffi::Error {
-                    code: ffi::ErrorCode::CannotOpen,
-                    extended_code: ffi::SQLITE_IOERR,
-                },
-                Some(_),
-            )
+            dst.deserialize_read_exact(MAIN_DB, &read[..], 1024, true).unwrap_err(),
+            Error::DeserializationReadFailure(error) if error.kind() == std::io::ErrorKind::UnexpectedEof
         );
         Ok(())
     }

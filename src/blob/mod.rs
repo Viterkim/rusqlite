@@ -371,9 +371,9 @@ impl io::Seek for Blob<'_> {
     #[inline]
     fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
         let pos = match pos {
-            io::SeekFrom::Start(offset) => offset as i64,
-            io::SeekFrom::Current(offset) => i64::from(self.pos) + offset,
-            io::SeekFrom::End(offset) => i64::from(self.size()) + offset,
+            io::SeekFrom::Start(offset) => i128::from(offset),
+            io::SeekFrom::Current(offset) => i128::from(self.pos) + i128::from(offset),
+            io::SeekFrom::End(offset) => i128::from(self.size()) + i128::from(offset),
         };
 
         if pos < 0 {
@@ -381,7 +381,7 @@ impl io::Seek for Blob<'_> {
                 io::ErrorKind::InvalidInput,
                 "invalid seek to negative position",
             ))
-        } else if pos > i64::from(self.size()) {
+        } else if pos > i128::from(self.size()) {
             Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid seek to position past end of blob",
