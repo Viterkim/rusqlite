@@ -93,7 +93,7 @@ pub use crate::cache::CachedStatement;
 pub use crate::column::Column;
 #[cfg(feature = "column_metadata")]
 pub use crate::column::ColumnMetadata;
-pub use crate::error::{Error, to_sqlite_error};
+pub use crate::error::{Error, StatementCompletionError, to_sqlite_error};
 pub use crate::ffi::ErrorCode;
 #[cfg(feature = "load_extension")]
 pub use crate::load_extension_guard::LoadExtensionGuard;
@@ -597,11 +597,9 @@ impl Connection {
                 .db
                 .borrow_mut()
                 .prepare(self, sql, PrepFlags::default())?;
-            if !stmt.stmt.is_null() && stmt.step()? {
-                // Some PRAGMA may return rows
-                if false {
-                    return Err(Error::ExecuteReturnedResults);
-                }
+            if !stmt.stmt.is_null() {
+                stmt.step()?;
+                stmt.finalize()?;
             }
             if tail == 0 || tail >= sql.len() {
                 break;
@@ -769,6 +767,9 @@ impl Connection {
     /// single row, and execute a mapping via `f` on that returned row with
     /// the possibility of failure. The `Result` type of `f` must implement
     /// `std::convert::From<Error>`.
+    ///
+    /// Decoder errors are returned directly as `E`. Use [`Connection::query_first`]
+    /// to retain both a decoder error and any error encountered finishing the statement.
     ///
     /// ## Example
     ///

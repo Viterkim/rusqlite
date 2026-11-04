@@ -27,14 +27,26 @@ pub enum QueryError<E> {
         row: usize,
         /// The original decoder error, with no conversion required.
         source: E,
+        /// A failure while finishing the statement after decoding failed.
+        finish_error: Option<Box<Error>>,
     },
 }
 impl<E: fmt::Display> fmt::Display for QueryError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Sql { sql, source } => write!(f, "query {sql:?}: {source}"),
-            Self::Decode { sql, row, source } => {
-                write!(f, "decode row {row} from {sql:?}: {source}")
+            Self::Decode {
+                sql,
+                row,
+                source,
+                finish_error,
+            } => {
+                write!(f, "decode row {row} from {sql:?}: {source}")?;
+                if let Some(error) = finish_error {
+                    write!(f, ", statement completion failed: {error}")?;
+                }
+
+                Ok(())
             }
         }
     }
@@ -75,11 +87,17 @@ impl Connection {
         let mut values = Vec::new();
 
         while let Some(row) = rows.next().map_err(sql_error)? {
-            let value = decode(row).map_err(|source| QueryError::Decode {
-                sql: sql.into(),
-                row: values.len(),
-                source,
-            })?;
+            let value = match decode(row) {
+                Ok(value) => value,
+                Err(source) => {
+                    return Err(QueryError::Decode {
+                        sql: sql.into(),
+                        row: values.len(),
+                        source,
+                        finish_error: rows.finish().err().map(Box::new),
+                    });
+                }
+            };
             values.push(value);
         }
 
@@ -110,20 +128,21 @@ impl Connection {
         let mut stmt = self.prepare(sql).map_err(sql_error)?;
         let mut rows = stmt.query(params).map_err(sql_error)?;
 
-        let value = rows
-            .next()
-            .map_err(sql_error)?
-            .map(|row| {
-                decode(row).map_err(|source| QueryError::Decode {
-                    sql: sql.into(),
-                    row: 0,
-                    source,
-                })
-            })
-            .transpose()?;
-        rows.finish().map_err(sql_error)?;
+        let result = rows.next().map_err(sql_error)?.map(decode).transpose();
+        let finish = rows.finish();
 
-        Ok(value)
+        match result {
+            Ok(value) => {
+                finish.map_err(sql_error)?;
+                Ok(value)
+            }
+            Err(source) => Err(QueryError::Decode {
+                sql: sql.into(),
+                row: 0,
+                source,
+                finish_error: finish.err().map(Box::new),
+            }),
+        }
     }
 
     /// Execute a statement using the prepared statement cache.

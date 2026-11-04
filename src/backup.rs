@@ -176,19 +176,19 @@ pub struct Progress {
     pub pagecount: c_int,
 }
 
-/// A backup failure from SQLite or the progress callback.
+/// A backup failure from SQLite or a caller's callback.
 #[derive(Debug)]
 pub enum BackupError<E> {
     /// SQLite could not perform the backup step.
     Sqlite(Box<Error>),
-    /// The progress callback stopped the backup loop.
+    /// The pre-step check or progress callback stopped the backup loop.
     Callback(E),
 }
 impl<E: fmt::Display> fmt::Display for BackupError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Sqlite(error) => write!(f, "Backup failed: {error}"),
-            Self::Callback(error) => write!(f, "Backup progress callback failed: {error}"),
+            Self::Callback(error) => write!(f, "Backup callback failed: {error}"),
         }
     }
 }
@@ -348,9 +348,28 @@ impl Backup<'_, '_> {
         &self,
         pages_per_step: c_int,
         pause_between_pages: Duration,
+        progress: F,
+    ) -> Result<(), BackupError<E>>
+    where
+        F: FnMut(StepResult, Progress) -> Result<(), E>,
+    {
+        self.run_to_completion_checked(pages_per_step, pause_between_pages, || Ok(()), progress)
+    }
+
+    /// Run a backup with a fallible check before the first and every later step.
+    ///
+    /// A failed check stops before copying more pages. Progress is reported
+    /// after each successful step call, including `Busy`, `Locked`, and `Done`.
+    /// Both callbacks can borrow caller state and return their original errors.
+    pub fn run_to_completion_checked<E, C, F>(
+        &self,
+        pages_per_step: c_int,
+        pause_between_pages: Duration,
+        mut check: C,
         mut progress: F,
     ) -> Result<(), BackupError<E>>
     where
+        C: FnMut() -> Result<(), E>,
         F: FnMut(StepResult, Progress) -> Result<(), E>,
     {
         use self::StepResult::{Busy, Done, Locked, More};
@@ -363,6 +382,7 @@ impl Backup<'_, '_> {
         }
 
         loop {
+            check().map_err(BackupError::Callback)?;
             let result = self
                 .step(pages_per_step)
                 .map_err(|error| BackupError::Sqlite(Box::new(error)))?;

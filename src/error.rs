@@ -29,6 +29,42 @@ macro_rules! cfg_select {
     }}
 }
 
+/// An operation error together with an error encountered while finishing its statement.
+#[derive(Debug, PartialEq)]
+pub struct StatementCompletionError {
+    /// The original operation or decoding failure.
+    pub error: Error,
+    /// Failure while resetting the statement after the original error.
+    pub finish_error: Error,
+}
+impl fmt::Display for StatementCompletionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}, statement completion failed: {}",
+            self.error, self.finish_error
+        )
+    }
+}
+impl error::Error for StatementCompletionError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+pub fn statement_result<T>(result: Result<T>, finish: Result<()>) -> Result<T> {
+    match (result, finish) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(finish_error)) => Err(Error::StatementCompletionFailure(Box::new(
+            StatementCompletionError {
+                error,
+                finish_error,
+            },
+        ))),
+    }
+}
+
 /// Enum listing possible errors from rusqlite.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -50,9 +86,20 @@ pub enum Error {
     /// A value conversion failed outside a row, where column context is unavailable.
     ValueConversionFailure(FromSqlError),
 
+    /// An operation failed and finishing its statement failed too.
+    StatementCompletionFailure(Box<StatementCompletionError>),
+
     /// A session streaming callback failed with its original I/O error.
     #[cfg(feature = "session")]
     SessionIoFailure(ffi::Error, std::io::Error),
+
+    /// A session capture filter panicked, leaving its recorded changes incomplete.
+    #[cfg(feature = "session")]
+    SessionCaptureFailure,
+
+    /// A changeset apply or filter failed, with its cleanup outcome retained.
+    #[cfg(feature = "session")]
+    SessionApplyFailure(Box<crate::session::SessionApplyFailure>),
 
     /// Error when SQLite gives us an integral value outside the range of the
     /// requested type (e.g., trying to get the value 1000 into a `u8`).
@@ -178,6 +225,9 @@ impl PartialEq for Error {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::ValueConversionFailure(a), Self::ValueConversionFailure(b)) => a == b,
+            (Self::StatementCompletionFailure(a), Self::StatementCompletionFailure(b)) => a == b,
+            #[cfg(feature = "session")]
+            (Self::SessionCaptureFailure, Self::SessionCaptureFailure) => true,
             (Self::ColumnConversionFailure(a), Self::ColumnConversionFailure(b)) => a == b,
             (Self::SqliteFailure(e1, s1), Self::SqliteFailure(e2, s2)) => e1 == e2 && s1 == s2,
             (Self::SqliteSingleThreadedMode, Self::SqliteSingleThreadedMode) => true,
@@ -272,6 +322,14 @@ impl fmt::Display for Error {
         match *self {
             Self::ColumnConversionFailure(ref error) => error.fmt(f),
             Self::ValueConversionFailure(ref error) => error.fmt(f),
+            Self::StatementCompletionFailure(ref error) => error.fmt(f),
+            #[cfg(feature = "session")]
+            Self::SessionCaptureFailure => write!(
+                f,
+                "Session capture filter failed, recorded changes are incomplete"
+            ),
+            #[cfg(feature = "session")]
+            Self::SessionApplyFailure(ref error) => error.fmt(f),
             #[cfg(feature = "session")]
             Self::SessionIoFailure(ref sqlite, ref source) => write!(f, "{sqlite}: {source}"),
             Self::SqliteFailure(ref err, None) => err.fmt(f),
@@ -371,6 +429,11 @@ impl error::Error for Error {
         match *self {
             Self::ColumnConversionFailure(ref error) => Some(&**error),
             Self::ValueConversionFailure(ref error) => Some(error),
+            Self::StatementCompletionFailure(ref error) => Some(&**error),
+            #[cfg(feature = "session")]
+            Self::SessionCaptureFailure => None,
+            #[cfg(feature = "session")]
+            Self::SessionApplyFailure(ref error) => Some(&**error),
             #[cfg(feature = "session")]
             Self::SessionIoFailure(_, ref source) => Some(source),
             Self::SqliteFailure(ref err, _) => Some(err),
@@ -428,6 +491,22 @@ impl Error {
     pub fn sqlite_error(&self) -> Option<&ffi::Error> {
         match self {
             Self::SqliteFailure(error, _) | Self::SqlInputError { error, .. } => Some(error),
+            Self::StatementCompletionFailure(error) => error
+                .error
+                .sqlite_error()
+                .or_else(|| error.finish_error.sqlite_error()),
+            #[cfg(feature = "session")]
+            Self::SessionApplyFailure(error) => error
+                .apply_error
+                .as_deref()
+                .and_then(Error::sqlite_error)
+                .or_else(|| {
+                    error
+                        .rollback_error
+                        .as_deref()
+                        .and_then(Error::sqlite_error)
+                })
+                .or_else(|| error.release_error.as_deref().and_then(Error::sqlite_error)),
             #[cfg(feature = "session")]
             Self::SessionIoFailure(error, _) => Some(error),
             _ => None,

@@ -107,6 +107,8 @@ pub enum TransactionFailure<E> {
     Operation(E),
     /// Committing the transaction or releasing its savepoint failed.
     Commit(Error),
+    /// The callback succeeded, but rollback or savepoint release failed.
+    Cleanup,
 }
 
 /// A scoped transaction or savepoint failure together with cleanup failures.
@@ -120,6 +122,8 @@ pub struct TransactionError<E> {
     pub cause: TransactionFailure<E>,
     /// Failure while rolling back changes after the original failure.
     pub rollback_error: Option<Box<Error>>,
+    /// Whether cleanup attempted a rollback statement.
+    pub rollback_attempted: bool,
     /// Failure while releasing a rolled back savepoint, unused for transactions.
     pub release_error: Option<Box<Error>>,
     /// Whether the connection is in autocommit mode after cleanup.
@@ -133,6 +137,7 @@ impl<E: fmt::Display> fmt::Display for TransactionError<E> {
                 write!(f, "Transaction operation failed: {error}")
             }
             TransactionFailure::Commit(error) => write!(f, "Could not commit transaction: {error}"),
+            TransactionFailure::Cleanup => write!(f, "Could not finish rollback scope"),
         }?;
 
         if let Some(error) = &self.rollback_error {
@@ -150,6 +155,11 @@ impl<E: error::Error + 'static> error::Error for TransactionError<E> {
         match &self.cause {
             TransactionFailure::Begin(error) | TransactionFailure::Commit(error) => Some(error),
             TransactionFailure::Operation(error) => Some(error),
+            TransactionFailure::Cleanup => self
+                .rollback_error
+                .as_deref()
+                .or(self.release_error.as_deref())
+                .map(|error| error as _),
         }
     }
 }
@@ -556,6 +566,7 @@ impl Connection {
             Transaction::new_unchecked(self, behavior).map_err(|error| TransactionError {
                 cause: TransactionFailure::Begin(error),
                 rollback_error: None,
+                rollback_attempted: false,
                 release_error: None,
                 is_autocommit: self.is_autocommit(),
             })?;
@@ -568,16 +579,18 @@ impl Connection {
             Err(error) => TransactionFailure::Operation(error),
         };
 
-        let rollback_error = if self.is_autocommit() {
-            None
-        } else {
+        let rollback_attempted = !self.is_autocommit();
+        let rollback_error = if rollback_attempted {
             transaction.rollback_().err().map(Box::new)
+        } else {
+            None
         };
         transaction.set_drop_behavior(DropBehavior::Ignore);
 
         Err(TransactionError {
             cause,
             rollback_error,
+            rollback_attempted,
             release_error: None,
             is_autocommit: self.is_autocommit(),
         })
@@ -673,6 +686,7 @@ impl Connection {
             .map_err(|error| TransactionError {
                 cause: TransactionFailure::Begin(error),
                 rollback_error: None,
+                rollback_attempted: false,
                 release_error: None,
                 is_autocommit: self.is_autocommit(),
             })?;
@@ -687,7 +701,8 @@ impl Connection {
 
         let mut rollback_error = None;
         let mut release_error = None;
-        if !self.is_autocommit() {
+        let rollback_attempted = !self.is_autocommit();
+        if rollback_attempted {
             match savepoint.rollback() {
                 Ok(()) => release_error = savepoint.commit_().err().map(Box::new),
                 Err(error) => rollback_error = Some(Box::new(error)),
@@ -698,6 +713,50 @@ impl Connection {
         Err(TransactionError {
             cause,
             rollback_error,
+            rollback_attempted,
+            release_error,
+            is_autocommit: self.is_autocommit(),
+        })
+    }
+
+    /// Run an operation inside a savepoint and roll it back even on success.
+    ///
+    /// Returns the callback's value only after rollback and release succeed.
+    /// Callback and cleanup errors are retained together. A failed rollback
+    /// skips release so cleanup cannot commit the temporary changes.
+    pub fn with_rollback_savepoint<T, E, F>(&self, operation: F) -> Result<T, TransactionError<E>>
+    where
+        F: FnOnce(&Connection) -> Result<T, E>,
+    {
+        let mut savepoint = self
+            .unchecked_savepoint()
+            .map_err(|error| TransactionError {
+                cause: TransactionFailure::Begin(error),
+                rollback_error: None,
+                rollback_attempted: false,
+                release_error: None,
+                is_autocommit: self.is_autocommit(),
+            })?;
+
+        let result = operation(&savepoint);
+        let rollback_error = savepoint.rollback().err().map(Box::new);
+        let release_error = if rollback_error.is_none() {
+            savepoint.commit_().err().map(Box::new)
+        } else {
+            None
+        };
+        savepoint.set_drop_behavior(DropBehavior::Ignore);
+
+        let cause = match result {
+            Ok(value) if rollback_error.is_none() && release_error.is_none() => return Ok(value),
+            Ok(_) => TransactionFailure::Cleanup,
+            Err(error) => TransactionFailure::Operation(error),
+        };
+
+        Err(TransactionError {
+            cause,
+            rollback_error,
+            rollback_attempted: true,
             release_error,
             is_autocommit: self.is_autocommit(),
         })

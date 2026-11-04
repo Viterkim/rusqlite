@@ -1,14 +1,19 @@
 //! [Session Extension](https://sqlite.org/sessionintro.html)
 #![expect(non_camel_case_types)]
 
+use std::any::Any;
 use std::collections::TryReserveError;
 use std::error::Error as StdError;
 use std::ffi::{CStr, c_char, c_int, c_uchar, c_void};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::marker::PhantomData;
-use std::panic::catch_unwind;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use fallible_streaming_iterator::FallibleStreamingIterator;
 
@@ -21,7 +26,18 @@ use crate::{Connection, MAIN_DB, Name, Result, errmsg_to_string};
 
 // https://sqlite.org/session.html
 
-type Filter = Option<Box<dyn Fn(&str) -> bool>>;
+type Filter = Option<Box<dyn Any>>;
+
+#[derive(Default)]
+struct CaptureState {
+    failed: AtomicBool,
+    active: AtomicBool,
+}
+
+struct CaptureFilter<F> {
+    callback: F,
+    state: Arc<CaptureState>,
+}
 
 /// An instance of this object is a session that can be
 /// used to record changes to a database.
@@ -29,6 +45,7 @@ pub struct Session<'conn> {
     phantom: PhantomData<&'conn Connection>,
     s: *mut ffi::sqlite3_session,
     filter: Filter,
+    capture: Arc<CaptureState>,
 }
 
 /// Failure while collecting a changeset into a bounded byte buffer.
@@ -91,14 +108,24 @@ impl Session<'_> {
             phantom: PhantomData,
             s,
             filter: None,
+            capture: Arc::default(),
         })
     }
 
-    /// Set a table filter
+    /// Set a table filter.
+    ///
+    /// A panicking filter permanently invalidates capture for this session.
+    /// Extraction then returns [`Error::SessionCaptureFailure`], even after
+    /// replacing or removing the filter. Create a new session to start again.
     pub fn table_filter<F>(&mut self, filter: Option<F>)
     where
         F: Fn(&str) -> bool + Send + 'static,
     {
+        if self.capture.active.load(Ordering::Relaxed) {
+            self.capture.failed.store(true, Ordering::Relaxed);
+            return;
+        }
+
         unsafe extern "C" fn call_boxed_closure<F>(
             p_arg: *mut c_void,
             tbl_str: *const c_char,
@@ -106,34 +133,67 @@ impl Session<'_> {
         where
             F: Fn(&str) -> bool,
         {
-            unsafe {
-                let tbl_name = CStr::from_ptr(tbl_str).to_str();
-                c_int::from(
-                    catch_unwind(|| {
-                        let boxed_filter: *mut F = p_arg.cast::<F>();
-                        (*boxed_filter)(tbl_name.expect("non-utf8 table name"))
-                    })
-                    .unwrap_or_default(),
-                )
+            // Registration owns this boxed context until the callback returns.
+            let filter = unsafe { &*p_arg.cast::<CaptureFilter<F>>() };
+            if filter.state.failed.load(Ordering::Relaxed) {
+                return 0;
+            }
+            if filter.state.active.swap(true, Ordering::Relaxed) {
+                filter.state.failed.store(true, Ordering::Relaxed);
+                return 0;
+            }
+
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                // SQLite supplies a terminated table name for this call.
+                unsafe { CStr::from_ptr(tbl_str) }
+                    .to_str()
+                    .ok()
+                    .map(|name| (filter.callback)(name))
+            }));
+            filter.state.active.store(false, Ordering::Relaxed);
+
+            match result {
+                Ok(Some(include)) if !filter.state.failed.load(Ordering::Relaxed) => {
+                    c_int::from(include)
+                }
+                Ok(Some(_)) | Ok(None) | Err(_) => {
+                    filter.state.failed.store(true, Ordering::Relaxed);
+                    0
+                }
             }
         }
 
         match filter {
-            Some(filter) => {
-                let boxed_filter = Box::new(filter);
+            Some(callback) => {
+                let filter = Box::new(CaptureFilter {
+                    callback,
+                    state: Arc::clone(&self.capture),
+                });
                 unsafe {
                     ffi::sqlite3session_table_filter(
                         self.s,
                         Some(call_boxed_closure::<F>),
-                        &*boxed_filter as *const F as *mut _,
+                        (&*filter as *const CaptureFilter<F>).cast_mut().cast(),
                     );
                 }
-                self.filter = Some(boxed_filter);
+                self.filter = Some(filter);
             }
-            _ => {
+            None => {
                 unsafe { ffi::sqlite3session_table_filter(self.s, None, ptr::null_mut()) }
                 self.filter = None;
             }
+        }
+    }
+
+    /// Check whether this session's capture is still complete.
+    ///
+    /// Extraction calls this automatically. Call it before using
+    /// [`Session::is_empty`] to decide that no extraction is needed.
+    pub fn check_capture(&self) -> Result<()> {
+        if self.capture.failed.load(Ordering::Relaxed) {
+            Err(Error::SessionCaptureFailure)
+        } else {
+            Ok(())
         }
     }
 
@@ -168,10 +228,14 @@ impl Session<'_> {
 
     /// Generate a Changeset
     pub fn changeset(&mut self) -> Result<Changeset> {
+        self.check_capture()?;
+
         let mut n = 0;
         let mut cs: *mut c_void = ptr::null_mut();
         check(unsafe { ffi::sqlite3session_changeset(self.s, &mut n, &mut cs) })?;
-        Ok(Changeset { cs, n })
+        let changeset = Changeset { cs, n };
+        self.check_capture()?;
+        Ok(changeset)
     }
 
     /// Collect a changeset, stopping when its emitted bytes exceed `max_bytes`.
@@ -197,37 +261,49 @@ impl Session<'_> {
     /// Write the set of changes represented by this session to `output`.
     #[inline]
     pub fn changeset_strm(&mut self, output: &mut dyn Write) -> Result<()> {
+        self.check_capture()?;
+
         let mut output = Stream::new(output);
         let result = check(unsafe {
             ffi::sqlite3session_changeset_strm(self.s, Some(x_output), output.context())
         });
 
-        stream_result(result, output.error)
+        stream_result(result, output.error)?;
+        self.check_capture()
     }
 
     /// Generate a Patchset
     #[inline]
     pub fn patchset(&mut self) -> Result<Changeset> {
+        self.check_capture()?;
+
         let mut n = 0;
         let mut ps: *mut c_void = ptr::null_mut();
         check(unsafe { ffi::sqlite3session_patchset(self.s, &mut n, &mut ps) })?;
         // TODO Validate: same struct
-        Ok(Changeset { cs: ps, n })
+        let patchset = Changeset { cs: ps, n };
+        self.check_capture()?;
+        Ok(patchset)
     }
 
     /// Write the set of patches represented by this session to `output`.
     #[inline]
     pub fn patchset_strm(&mut self, output: &mut dyn Write) -> Result<()> {
+        self.check_capture()?;
+
         let mut output = Stream::new(output);
         let result = check(unsafe {
             ffi::sqlite3session_patchset_strm(self.s, Some(x_output), output.context())
         });
 
-        stream_result(result, output.error)
+        stream_result(result, output.error)?;
+        self.check_capture()
     }
 
     /// Load the difference between tables.
     pub fn diff<F: Name, T: Name>(&mut self, from: F, table: T) -> Result<()> {
+        self.check_capture()?;
+
         let from = from.as_cstr()?;
         let table = table.as_cstr()?;
         let table = table.as_ptr();
@@ -246,10 +322,13 @@ impl Session<'_> {
                 return Err(error_from_sqlite_code(r, message));
             }
         }
-        Ok(())
+        self.check_capture()
     }
 
-    /// Test if a changeset has recorded any changes
+    /// Test if a changeset has recorded any changes.
+    ///
+    /// This reports SQLite's recorded data. Use [`Session::check_capture`] to
+    /// check that a failed filter has not skipped changes.
     #[inline]
     pub fn is_empty(&self) -> bool {
         unsafe { ffi::sqlite3session_isempty(self.s) != 0 }
@@ -287,6 +366,15 @@ impl Session<'_> {
 impl Drop for Session<'_> {
     #[inline]
     fn drop(&mut self) {
+        if self.capture.active.load(Ordering::Relaxed) {
+            self.capture.failed.store(true, Ordering::Relaxed);
+            // SQLite resumes its native session after this callback returns.
+            // Retain both allocations so dropping inside the callback cannot
+            // free either the running closure or SQLite's current session.
+            std::mem::forget(self.filter.take());
+            return;
+        }
+
         if self.filter.is_some() {
             self.table_filter(None::<fn(&str) -> bool>);
         }
@@ -933,6 +1021,60 @@ bitflags::bitflags! {
     }
 }
 
+/// An apply outcome together with failures from its filter and cleanup.
+#[derive(Debug)]
+pub struct SessionApplyFailure {
+    /// The original error returned by SQLite's apply call.
+    pub apply_error: Option<Box<Error>>,
+    /// The original streaming I/O failure, when one occurred.
+    pub io_error: Option<io::Error>,
+    /// Whether the table filter panicked.
+    pub filter_panicked: bool,
+    /// Whether rolling back the outer savepoint was attempted.
+    pub rollback_attempted: bool,
+    /// Failure while rolling back the outer savepoint.
+    pub rollback_error: Option<Box<Error>>,
+    /// Failure while releasing the outer savepoint.
+    pub release_error: Option<Box<Error>>,
+    /// Whether the connection was in autocommit mode after cleanup.
+    pub is_autocommit: bool,
+}
+impl fmt::Display for SessionApplyFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "changeset apply failed")?;
+        if let Some(error) = &self.apply_error {
+            write!(f, ": {error}")?;
+        }
+        if self.filter_panicked {
+            write!(f, ", table filter panicked")?;
+        }
+        if let Some(error) = &self.io_error {
+            write!(f, ", streaming I/O failed: {error}")?;
+        }
+        if let Some(error) = &self.rollback_error {
+            write!(f, ", rollback failed: {error}")?;
+        }
+        if let Some(error) = &self.release_error {
+            write!(f, ", release failed: {error}")?;
+        }
+
+        Ok(())
+    }
+}
+impl StdError for SessionApplyFailure {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        if let Some(error) = &self.io_error {
+            return Some(error);
+        }
+
+        self.apply_error
+            .as_deref()
+            .or(self.rollback_error.as_deref())
+            .or(self.release_error.as_deref())
+            .map(|error| error as &(dyn StdError + 'static))
+    }
+}
+
 /// Failure while applying a changeset with a fallible conflict callback.
 ///
 /// Callback errors have no trait bounds. This wrapper implements
@@ -1351,7 +1493,8 @@ impl Connection {
         C: for<'a> FnMut(ConflictType, ChangesetItem<'a>) -> ConflictAction,
     {
         let filtered = filter.is_some();
-        if filtered && use_savepoint {
+        let saved = filtered && use_savepoint;
+        if saved {
             self.execute_batch("SAVEPOINT _rusqlite_changeset_filter")?;
         }
 
@@ -1364,18 +1507,50 @@ impl Connection {
             filtered,
             (&mut callbacks as *mut ApplyCallbacks<F, C>).cast(),
         );
+        let mut rollback_attempted = false;
+        let mut rollback_error = None;
+        let mut release_error = None;
 
-        if filtered && use_savepoint {
-            if callbacks.filter_panicked {
-                self.execute_batch(
-                    "ROLLBACK TO _rusqlite_changeset_filter; RELEASE _rusqlite_changeset_filter",
-                )?;
-                return Err(error_from_sqlite_code(ffi::SQLITE_ABORT, None));
+        if saved {
+            if callbacks.filter_panicked || result.is_err() {
+                if !self.is_autocommit() {
+                    rollback_attempted = true;
+                    rollback_error = self
+                        .execute_batch("ROLLBACK TO _rusqlite_changeset_filter")
+                        .err()
+                        .map(Box::new);
+                    if rollback_error.is_none() {
+                        release_error = self
+                            .execute_batch("RELEASE _rusqlite_changeset_filter")
+                            .err()
+                            .map(Box::new);
+                    }
+                }
+            } else {
+                release_error = self
+                    .execute_batch("RELEASE _rusqlite_changeset_filter")
+                    .err()
+                    .map(Box::new);
+                if release_error.is_some() && !self.is_autocommit() {
+                    rollback_attempted = true;
+                    rollback_error = self
+                        .execute_batch("ROLLBACK TO _rusqlite_changeset_filter")
+                        .err()
+                        .map(Box::new);
+                }
             }
-            self.execute_batch("RELEASE _rusqlite_changeset_filter")?;
         }
-        if callbacks.filter_panicked {
-            return Err(error_from_sqlite_code(ffi::SQLITE_ABORT, None));
+
+        if callbacks.filter_panicked || rollback_error.is_some() || release_error.is_some() {
+            return Err(Error::SessionApplyFailure(Box::new(SessionApplyFailure {
+                apply_error: result.err().map(Box::new),
+                io_error: None,
+                filter_panicked: callbacks.filter_panicked,
+                rollback_attempted,
+                rollback_error,
+                release_error,
+                is_autocommit: self.is_autocommit(),
+            })));
         }
 
         result
@@ -1437,6 +1612,9 @@ where
         c_int::from(
             catch_unwind(|| {
                 let callbacks = &mut *p_ctx.cast::<ApplyCallbacks<F, C>>();
+                if callbacks.filter_panicked {
+                    return false;
+                }
                 if let Some(ref mut filter) = callbacks.filter {
                     filter(tbl_name.expect("illegal table name"))
                 } else {
@@ -1521,8 +1699,16 @@ impl<'a, T: ?Sized> Stream<'a, T> {
 }
 
 fn stream_result<T>(result: Result<T>, error: Option<io::Error>) -> Result<T> {
-    match error {
-        Some(error) => {
+    let Some(error) = error else {
+        return result;
+    };
+
+    match result {
+        Err(Error::SessionApplyFailure(mut failure)) => {
+            failure.io_error = Some(error);
+            Err(Error::SessionApplyFailure(failure))
+        }
+        result => {
             let code = result
                 .as_ref()
                 .err()
@@ -1531,7 +1717,6 @@ fn stream_result<T>(result: Result<T>, error: Option<io::Error>) -> Result<T> {
 
             Err(Error::SessionIoFailure(ffi::Error::new(code), error))
         }
-        None => result,
     }
 }
 
@@ -1648,6 +1833,54 @@ mod test {
         let mut output = Vec::new();
         session.changeset_strm(&mut output)?;
         Ok(output)
+    }
+
+    #[test]
+    fn capture_panic() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY)")?;
+        let mut session = Session::new(&db)?;
+        session.table_filter(Some(|_: &str| panic!("capture failed")));
+        let mut session = std::hint::black_box(session);
+        db.execute("INSERT INTO t VALUES (1)", [])?;
+        session.table_filter(None::<fn(&str) -> bool>);
+
+        assert!(matches!(
+            session.changeset(),
+            Err(crate::Error::SessionCaptureFailure)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn apply_cleanup() -> Result<()> {
+        use crate::hooks::{AuthAction, Authorization, TransactionOperation};
+
+        let changeset = one_changeset_insert()?;
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(
+            "CREATE TABLE foo(t TEXT PRIMARY KEY NOT NULL); INSERT INTO foo VALUES ('bar')",
+        )?;
+        db.authorizer(Some(
+            |context: crate::hooks::AuthContext<'_>| match context.action {
+                AuthAction::Savepoint {
+                    operation: TransactionOperation::Rollback,
+                    ..
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            },
+        ))?;
+        let error = db
+            .apply(&changeset, Some(|_: &str| true), |_, _| {
+                ConflictAction::SQLITE_CHANGESET_ABORT
+            })
+            .unwrap_err();
+        let crate::Error::SessionApplyFailure(error) = error else {
+            panic!("lost apply or cleanup failure");
+        };
+
+        assert!(error.apply_error.is_some() && error.rollback_error.is_some());
+        Ok(())
     }
 
     #[test]

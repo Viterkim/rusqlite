@@ -7,6 +7,7 @@ use super::{
     AndThenRows, Connection, Error, MappedRows, Params, RawStatement, Result, Row, Rows, ValueRef,
 };
 use crate::bind::BindIndex;
+use crate::error::statement_result;
 use crate::types::{ToSql, ToSqlOutput, Value};
 use crate::util::from_raw_parts;
 
@@ -375,10 +376,9 @@ impl Statement<'_> {
         F: FnOnce(&Row<'_>) -> Result<T>,
     {
         let mut rows = self.query(params)?;
-        let value = rows.get_expected_row().and_then(f)?;
-        rows.finish()?;
+        let result = rows.get_expected_row().and_then(f);
 
-        Ok(value)
+        statement_result(result, rows.finish())
     }
 
     /// Convenience method to execute a query that is expected to return exactly
@@ -401,11 +401,16 @@ impl Statement<'_> {
         F: FnOnce(&Row<'_>) -> Result<T>,
     {
         let mut rows = self.query(params)?;
-        let row = rows.get_expected_row().and_then(f)?;
-        if rows.next()?.is_some() {
-            return Err(Error::QueryReturnedMoreThanOneRow);
-        }
-        Ok(row)
+        let result = (|| {
+            let row = rows.get_expected_row().and_then(f)?;
+            if rows.next()?.is_some() {
+                return Err(Error::QueryReturnedMoreThanOneRow);
+            }
+
+            Ok(row)
+        })();
+
+        statement_result(result, rows.finish())
     }
 
     /// Consumes the statement.
