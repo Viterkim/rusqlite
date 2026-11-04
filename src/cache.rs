@@ -198,6 +198,35 @@ mod test {
     }
 
     #[test]
+    #[cfg(all(
+        feature = "bundled",
+        not(feature = "bundled-sqlcipher"),
+        not(all(target_family = "wasm", target_os = "unknown"))
+    ))]
+    fn reprepare() -> Result<()> {
+        use crate::StatementStatus;
+
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(
+            "CREATE TABLE attachment(filename TEXT);
+             CREATE TABLE message_attachment_join(message_id INTEGER, attachment_id INTEGER);
+             CREATE INDEX message_attachment_join_idx ON message_attachment_join(message_id);",
+        )?;
+        let sql = "SELECT a.filename FROM message_attachment_join j
+                   LEFT JOIN attachment a ON j.attachment_id = a.ROWID
+                   WHERE j.message_id = ?1";
+
+        for id in 2..12 {
+            let mut stmt = db.prepare_cached(sql)?;
+            stmt.query([id])?.next()?;
+        }
+
+        let stmt = db.prepare_cached(sql)?;
+        assert_eq!(stmt.get_status(StatementStatus::RePrepare), 0);
+        Ok(())
+    }
+
+    #[test]
     fn test_cache() -> Result<()> {
         let db = Connection::open_in_memory()?;
         let cache = &db.cache;

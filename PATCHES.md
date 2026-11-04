@@ -1,6 +1,6 @@
 # Fork patches
 
-This fork adds savepoint and session APIs, plus fixes for Rust callbacks and streaming input. The `fork` branch groups related changes into shared connection APIs, session changes, and fork documentation.
+This fork adds savepoint and session APIs, plus fixes for callbacks, streaming input, cached statements, library selection, and timestamp parsing. Related changes stay grouped in a few commits on the `fork` branch.
 
 The upstream base is rusqlite/rusqlite commit 84beed6601ec2e261fea83c07834f5d861a9884a. Codec bindings and rarray rowid ordering are already part of that base. The patches here carry forward the earlier `extras` branch and include the streaming reader fix from the Snak vendored copy.
 
@@ -90,3 +90,17 @@ Configure the rebaser in the order the remote changesets were applied. SQLite ma
 ### Borrowed changeset bytes
 
 `ChangesetIter::start_bytes` iterates directly over a borrowed byte slice. `Connection::apply_bytes_with_flags` applies one directly with v2 flags, avoiding a streaming reader or an intermediate owned changeset. Iteration keeps the bytes borrowed for the iterator's lifetime, and apply borrows them for the duration of the call.
+
+## Other fixes
+
+### Cached statements
+
+Bundled native SQLite includes the upstream [535a77cf5a fix](https://github.com/sqlite/sqlite/commit/78793bee814300ff98a48970edfed9189a64f5c6) for repeated statement compilation after clearing bindings. This fixes [rusqlite #1931](https://github.com/rusqlite/rusqlite/issues/1931) while keeping SQLite's optimizations enabled. It applies to this fork's bundled SQLite source, with the reported version still 3.54.1.
+
+### Explicit library directories
+
+`SQLITE3_LIB_DIR` and `SQLCIPHER_LIB_DIR` take precedence over system pkg-config results, fixing [#510](https://github.com/rusqlite/rusqlite/issues/510). Dependency flags are read from a `.pc` file beside the selected library when one exists. Static linking requests also apply to that metadata lookup.
+
+### Invalid timestamps
+
+Reading an `OffsetDateTime` with the `time` feature returns a conversion error for malformed text, including short strings and Unicode at the date boundary. It no longer panics while looking for a timezone offset.

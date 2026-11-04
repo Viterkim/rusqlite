@@ -76,7 +76,10 @@ impl FromSql for OffsetDateTime {
                 // legacy
                 return Self::parse(s, &LEGACY_DATE_TIME_FORMAT).map_err(FromSqlError::other);
             }
-            if s[8..].contains('+') || s[8..].contains('-') {
+            if s.as_bytes()
+                .get(8..)
+                .is_some_and(|suffix| suffix.contains(&b'+') || suffix.contains(&b'-'))
+            {
                 // Formats 2-7 with timezone
                 return Self::parse(s, &OFFSET_DATE_TIME_FORMAT).map_err(FromSqlError::other);
             }
@@ -190,6 +193,18 @@ mod test {
         let db = Connection::open_in_memory()?;
         db.execute_batch("CREATE TABLE foo (t TEXT, i INTEGER AS (strftime('%s', t)), b BLOB)")?;
         Ok(db)
+    }
+
+    #[test]
+    fn invalid_offset_date_time() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+
+        for input in ["", "bad", "1234567é"] {
+            let result: Result<OffsetDateTime> = db.one_column("SELECT ?1", [input]);
+            assert!(result.is_err());
+        }
+
+        Ok(())
     }
 
     #[test]

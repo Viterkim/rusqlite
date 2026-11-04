@@ -486,19 +486,25 @@ mod build_linked {
         println!("cargo:link-target={link_lib}");
 
         // Allow users to specify where to find SQLite.
-        if let Ok(dir) = env::var(format!("{}_LIB_DIR", env_prefix())) {
-            // Try to use pkg-config to determine link commands
-            let pkgconfig_path = Path::new(&dir).join("pkgconfig");
-            unsafe { env::set_var("PKG_CONFIG_PATH", pkgconfig_path) };
+        if let Ok(_dir) = env::var(format!("{}_LIB_DIR", env_prefix())) {
             #[cfg(not(feature = "loadable_extension"))]
-            if pkg_config::Config::new()
-                .atleast_version("3.45.3")
-                .probe(link_lib)
-                .is_err()
             {
-                // Otherwise just emit the bare minimum link commands.
-                println!("cargo:rustc-link-lib={}={link_lib}", find_link_mode());
-                println!("cargo:rustc-link-search={dir}");
+                println!("cargo:rustc-link-search={_dir}");
+
+                // Keep dependency flags from the selected library's metadata without
+                // letting pkg-config fall back to a different system installation.
+                let pkgconfig_file = Path::new(&_dir)
+                    .join("pkgconfig")
+                    .join(format!("{link_lib}.pc"));
+                if !pkgconfig_file.is_file()
+                    || pkg_config::Config::new()
+                        .atleast_version("3.45.3")
+                        .statik(find_link_mode() == "static")
+                        .probe(&pkgconfig_file.to_string_lossy())
+                        .is_err()
+                {
+                    println!("cargo:rustc-link-lib={}={link_lib}", find_link_mode());
+                }
             }
             return HeaderLocation::FromEnvironment;
         }
