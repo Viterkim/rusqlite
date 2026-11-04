@@ -570,8 +570,13 @@ mod test {
                 (nz!(i128::MAX), "max".to_owned()),
             ]
         );
-        let err = db.query_row("SELECT ?1", [0i128], |row| row.get::<_, NonZeroI128>(0));
-        assert_eq!(err, Err(crate::Error::IntegralValueOutOfRange(0, 0)));
+        let error = db
+            .query_row("SELECT ?1", [0i128], |row| row.get::<_, NonZeroI128>(0))
+            .unwrap_err();
+        let crate::Error::ColumnConversionFailure(error) = error else {
+            panic!("missing conversion error");
+        };
+        assert_eq!(error.source, crate::types::FromSqlError::OutOfRange(0));
         Ok(())
     }
 

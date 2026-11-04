@@ -1,8 +1,10 @@
 //! [Session Extension](https://sqlite.org/sessionintro.html)
 #![expect(non_camel_case_types)]
 
+use std::error::Error as StdError;
 use std::ffi::{CStr, c_char, c_int, c_uchar, c_void};
-use std::io::{Read, Write};
+use std::fmt;
+use std::io::{self, Read, Write};
 use std::marker::PhantomData;
 use std::panic::catch_unwind;
 use std::ptr;
@@ -12,7 +14,7 @@ use fallible_streaming_iterator::FallibleStreamingIterator;
 use crate::error::{Error, check, error_from_sqlite_code};
 use crate::ffi;
 use crate::hooks::Action;
-use crate::types::ValueRef;
+use crate::types::{Value, ValueRef};
 use crate::util::{from_raw_parts, from_raw_parts_mut};
 use crate::{Connection, MAIN_DB, Name, Result, errmsg_to_string};
 
@@ -135,14 +137,12 @@ impl Session<'_> {
     /// Write the set of changes represented by this session to `output`.
     #[inline]
     pub fn changeset_strm(&mut self, output: &mut dyn Write) -> Result<()> {
-        let output_ref = &output;
-        check(unsafe {
-            ffi::sqlite3session_changeset_strm(
-                self.s,
-                Some(x_output),
-                output_ref as *const &mut dyn Write as *mut c_void,
-            )
-        })
+        let mut output = Stream::new(output);
+        let result = check(unsafe {
+            ffi::sqlite3session_changeset_strm(self.s, Some(x_output), output.context())
+        });
+
+        stream_result(result, output.error)
     }
 
     /// Generate a Patchset
@@ -158,14 +158,12 @@ impl Session<'_> {
     /// Write the set of patches represented by this session to `output`.
     #[inline]
     pub fn patchset_strm(&mut self, output: &mut dyn Write) -> Result<()> {
-        let output_ref = &output;
-        check(unsafe {
-            ffi::sqlite3session_patchset_strm(
-                self.s,
-                Some(x_output),
-                output_ref as *const &mut dyn Write as *mut c_void,
-            )
-        })
+        let mut output = Stream::new(output);
+        let result = check(unsafe {
+            ffi::sqlite3session_patchset_strm(self.s, Some(x_output), output.context())
+        });
+
+        stream_result(result, output.error)
     }
 
     /// Load the difference between tables.
@@ -239,16 +237,18 @@ impl Drop for Session<'_> {
 /// Invert a changeset
 #[inline]
 pub fn invert_strm(input: &mut dyn Read, output: &mut dyn Write) -> Result<()> {
-    let input_ref = &input;
-    let output_ref = &output;
-    check(unsafe {
+    let mut input = Stream::new(input);
+    let mut output = Stream::new(output);
+    let result = check(unsafe {
         ffi::sqlite3changeset_invert_strm(
             Some(x_input),
-            input_ref as *const &mut dyn Read as *mut c_void,
+            input.context(),
             Some(x_output),
-            output_ref as *const &mut dyn Write as *mut c_void,
+            output.context(),
         )
-    })
+    });
+
+    stream_result(result, input.error.or(output.error))
 }
 
 /// Combine two changesets
@@ -258,19 +258,21 @@ pub fn concat_strm(
     input_b: &mut dyn Read,
     output: &mut dyn Write,
 ) -> Result<()> {
-    let input_a_ref = &input_a;
-    let input_b_ref = &input_b;
-    let output_ref = &output;
-    check(unsafe {
+    let mut input_a = Stream::new(input_a);
+    let mut input_b = Stream::new(input_b);
+    let mut output = Stream::new(output);
+    let result = check(unsafe {
         ffi::sqlite3changeset_concat_strm(
             Some(x_input),
-            input_a_ref as *const &mut dyn Read as *mut c_void,
+            input_a.context(),
             Some(x_input),
-            input_b_ref as *const &mut dyn Read as *mut c_void,
+            input_b.context(),
             Some(x_output),
-            output_ref as *const &mut dyn Write as *mut c_void,
+            output.context(),
         )
-    })
+    });
+
+    stream_result(result, input_a.error.or(input_b.error).or(output.error))
 }
 
 /// Changeset or Patchset
@@ -300,7 +302,7 @@ impl Changeset {
             phantom: PhantomData,
             it,
             item: None,
-            _input: None,
+            input: None,
         })
     }
 
@@ -331,11 +333,7 @@ pub struct ChangesetIter<'changeset> {
     phantom: PhantomData<&'changeset [u8]>,
     it: *mut ffi::sqlite3_changeset_iter,
     item: Option<ChangesetItem<'changeset>>,
-    #[expect(
-        clippy::redundant_allocation,
-        reason = "SQLite retains a pointer to this stable reference slot"
-    )]
-    _input: Option<Box<&'changeset mut dyn Read>>,
+    input: Option<Box<Stream<'changeset, dyn Read + 'changeset>>>,
 }
 
 impl ChangesetIter<'_> {
@@ -364,7 +362,7 @@ impl ChangesetIter<'_> {
             phantom: PhantomData,
             it,
             item: None,
-            _input: None,
+            input: None,
         })
     }
 
@@ -383,23 +381,20 @@ impl ChangesetIter<'_> {
     /// drop(iter);
     /// ```
     pub fn start_strm(input: &mut dyn Read) -> Result<ChangesetIter<'_>> {
-        let mut input = Box::new(input);
+        let mut input = Box::new(Stream::new(input));
         let mut it = ptr::null_mut();
 
-        // The boxed reference slot stays at a stable address until SQLite finalizes the iterator.
-        check(unsafe {
-            ffi::sqlite3changeset_start_strm(
-                &mut it as *mut *mut _,
-                Some(x_input),
-                (&mut *input as *mut &mut dyn Read).cast(),
-            )
-        })?;
+        // SQLite retains this boxed callback context until the iterator is finalized.
+        let result = check(unsafe {
+            ffi::sqlite3changeset_start_strm(&mut it as *mut *mut _, Some(x_input), input.context())
+        });
+        stream_result(result, input.error.take())?;
 
         Ok(ChangesetIter {
             phantom: PhantomData,
             it,
             item: None,
-            _input: Some(input),
+            input: Some(input),
         })
     }
 
@@ -431,7 +426,10 @@ impl<'changeset> FallibleStreamingIterator for ChangesetIter<'changeset> {
                 Ok(())
             }
             ffi::SQLITE_DONE => Ok(()),
-            code => Err(error_from_sqlite_code(code, None)),
+            code => stream_result(
+                Err(error_from_sqlite_code(code, None)),
+                self.input.as_mut().and_then(|input| input.error.take()),
+            ),
         }
     }
 
@@ -502,6 +500,23 @@ pub enum ChangesetOperation {
     Delete,
 }
 
+/// An owned copy of a changeset row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OwnedChangesetRow {
+    /// Name of the affected table.
+    pub table: String,
+    /// Insert, update, or delete.
+    pub operation: ChangesetOperation,
+    /// Whether the change was marked indirect.
+    pub indirect: bool,
+    /// Which columns belong to the primary key.
+    pub primary_keys: Vec<bool>,
+    /// Old values. Absent fields are `None`, SQL NULL is `Some(Value::Null)`.
+    pub old: Vec<Option<Value>>,
+    /// New values. Absent fields are `None`, SQL NULL is `Some(Value::Null)`.
+    pub new: Vec<Option<Value>>,
+}
+
 impl Drop for ChangesetIter<'_> {
     #[inline]
     fn drop(&mut self) {
@@ -536,6 +551,45 @@ pub struct ChangesetItem<'a> {
 }
 
 impl ChangesetItem<'_> {
+    /// Copy the current change into owned values that can outlive the iterator.
+    ///
+    /// Missing update fields stay absent, which is different from SQL NULL.
+    /// Foreign key conflict callbacks do not carry a row.
+    pub fn to_owned(&self) -> Result<OwnedChangesetRow> {
+        let op = self.op()?;
+        let columns = op.column_count()?;
+        let operation = op.changeset_operation()?;
+        let mut old = Vec::with_capacity(columns);
+        let mut new = Vec::with_capacity(columns);
+
+        for column in 0..columns {
+            let old_value = match operation {
+                ChangesetOperation::Insert => None,
+                ChangesetOperation::Update | ChangesetOperation::Delete => {
+                    self.old_value_opt(column)?
+                }
+            };
+            let new_value = match operation {
+                ChangesetOperation::Delete => None,
+                ChangesetOperation::Insert | ChangesetOperation::Update => {
+                    self.new_value_opt(column)?
+                }
+            };
+
+            old.push(owned_value(column, old_value)?);
+            new.push(owned_value(column, new_value)?);
+        }
+
+        Ok(OwnedChangesetRow {
+            table: op.table_name().to_owned(),
+            operation,
+            indirect: op.indirect(),
+            primary_keys: self.pk()?.iter().map(|&column| column != 0).collect(),
+            old,
+            new,
+        })
+    }
+
     /// Return a conflicting column value, if present.
     ///
     /// Only valid during a DATA or CONFLICT callback.
@@ -620,6 +674,10 @@ impl ChangesetItem<'_> {
                 &mut code,
                 &mut indirect,
             ))?;
+            if pz_tab.is_null() {
+                return Err(error_from_sqlite_code(ffi::SQLITE_MISUSE, None));
+            }
+
             CStr::from_ptr(pz_tab)
         };
         let table_name = tab.to_str()?;
@@ -642,9 +700,23 @@ impl ChangesetItem<'_> {
                 &mut pks,
                 &mut number_of_columns,
             ))?;
+            if pks.is_null() && number_of_columns > 0 {
+                return Err(error_from_sqlite_code(ffi::SQLITE_MISUSE, None));
+            }
+
             Ok(from_raw_parts(pks, number_of_columns))
         }
     }
+}
+
+fn owned_value(column: usize, value: Option<ValueRef<'_>>) -> Result<Option<Value>> {
+    value
+        .map(|value| {
+            let sql_type = value.data_type();
+            Value::try_from(value)
+                .map_err(|error| Error::FromSqlConversionFailure(column, sql_type, Box::new(error)))
+        })
+        .transpose()
 }
 
 /// Used to combine two or more changesets or
@@ -671,14 +743,12 @@ impl Changegroup {
     /// Add a changeset read from `input` to this change group.
     #[inline]
     pub fn add_stream(&mut self, input: &mut dyn Read) -> Result<()> {
-        let input_ref = &input;
-        check(unsafe {
-            ffi::sqlite3changegroup_add_strm(
-                self.cg,
-                Some(x_input),
-                input_ref as *const &mut dyn Read as *mut c_void,
-            )
-        })
+        let mut input = Stream::new(input);
+        let result = check(unsafe {
+            ffi::sqlite3changegroup_add_strm(self.cg, Some(x_input), input.context())
+        });
+
+        stream_result(result, input.error)
     }
 
     /// Obtain a composite Changeset
@@ -693,14 +763,12 @@ impl Changegroup {
     /// Write the combined set of changes to `output`.
     #[inline]
     pub fn output_strm(&mut self, output: &mut dyn Write) -> Result<()> {
-        let output_ref = &output;
-        check(unsafe {
-            ffi::sqlite3changegroup_output_strm(
-                self.cg,
-                Some(x_output),
-                output_ref as *const &mut dyn Write as *mut c_void,
-            )
-        })
+        let mut output = Stream::new(output);
+        let result = check(unsafe {
+            ffi::sqlite3changegroup_output_strm(self.cg, Some(x_output), output.context())
+        });
+
+        stream_result(result, output.error)
     }
 }
 
@@ -762,17 +830,19 @@ impl Rebaser {
 
     /// Rebase a streamed local changeset into `output`.
     pub fn rebase_strm(&mut self, input: &mut dyn Read, output: &mut dyn Write) -> Result<()> {
-        let input_ref = &input;
-        let output_ref = &output;
-        check(unsafe {
+        let mut input = Stream::new(input);
+        let mut output = Stream::new(output);
+        let result = check(unsafe {
             ffi::sqlite3rebaser_rebase_strm(
                 self.rebaser,
                 Some(x_input),
-                input_ref as *const &mut dyn Read as *mut c_void,
+                input.context(),
                 Some(x_output),
-                output_ref as *const &mut dyn Write as *mut c_void,
+                output.context(),
             )
-        })
+        });
+
+        stream_result(result, input.error.or(output.error))
     }
 }
 impl Drop for Rebaser {
@@ -794,6 +864,42 @@ bitflags::bitflags! {
         const IGNORENOOP = ffi::SQLITE_CHANGESETAPPLY_IGNORENOOP;
         /// Treat foreign key actions as NO ACTION while applying.
         const FKNOACTION = ffi::SQLITE_CHANGESETAPPLY_FKNOACTION;
+    }
+}
+
+/// Failure while applying a changeset with a fallible conflict callback.
+///
+/// Callback errors have no trait bounds. This wrapper implements
+/// [`std::error::Error`] when `E` does. Match its variants to recover other
+/// error containers unchanged.
+#[derive(Debug)]
+pub enum SessionApplyError<E> {
+    /// SQLite or the table filter rejected the changeset.
+    Sqlite(Error),
+    /// The conflict callback failed. The SQLite apply outcome is retained too.
+    Callback {
+        /// The original callback error, with its concrete type unchanged.
+        error: E,
+        /// SQLite's error after the callback requested an abort.
+        sqlite: Option<Error>,
+    },
+}
+impl<E: fmt::Display> fmt::Display for SessionApplyError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sqlite(error) => error.fmt(f),
+            Self::Callback { error, .. } => {
+                write!(f, "changeset conflict callback failed: {error}")
+            }
+        }
+    }
+}
+impl<E: StdError + 'static> StdError for SessionApplyError<E> {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Sqlite(error) => Some(error),
+            Self::Callback { error, .. } => Some(error),
+        }
     }
 }
 
@@ -888,16 +994,16 @@ impl Connection {
         F: FnMut(&str) -> bool,
         C: for<'a> FnMut(ConflictType, ChangesetItem<'a>) -> ConflictAction,
     {
-        let input_ref = &input;
+        let mut input = Stream::new(input);
         let db = self.db.borrow_mut().db;
 
-        self.with_apply_callbacks(filter, conflict, true, |filtered, context| {
+        let result = self.with_apply_callbacks(filter, conflict, true, |filtered, context| {
             check(unsafe {
                 if filtered {
                     ffi::sqlite3changeset_apply_strm(
                         db,
                         Some(x_input),
-                        input_ref as *const &mut dyn Read as *mut c_void,
+                        input.context(),
                         Some(call_filter::<F, C>),
                         Some(call_conflict::<F, C>),
                         context,
@@ -906,14 +1012,16 @@ impl Connection {
                     ffi::sqlite3changeset_apply_strm(
                         db,
                         Some(x_input),
-                        input_ref as *const &mut dyn Read as *mut c_void,
+                        input.context(),
                         None,
                         Some(call_conflict::<F, C>),
                         context,
                     )
                 }
             })
-        })
+        });
+
+        stream_result(result, input.error)
     }
 
     /// Apply a changeset with SQLite's experimental v2 flags.
@@ -1016,6 +1124,44 @@ impl Connection {
         Ok(())
     }
 
+    /// Apply borrowed changeset bytes with a fallible conflict callback.
+    ///
+    /// A callback error aborts the apply and is returned unchanged alongside
+    /// SQLite's failure. The callback error can be any type.
+    pub fn apply_bytes_try<F, C, E>(
+        &self,
+        bytes: &[u8],
+        filter: Option<F>,
+        mut conflict: C,
+        flags: ChangesetApplyFlags,
+    ) -> Result<(), SessionApplyError<E>>
+    where
+        F: FnMut(&str) -> bool,
+        C: for<'a> FnMut(ConflictType, ChangesetItem<'a>) -> Result<ConflictAction, E>,
+    {
+        let mut callback_error = None;
+        let applied = self.apply_bytes_with_flags(
+            bytes,
+            filter,
+            |kind, item| match conflict(kind, item) {
+                Ok(action) => action,
+                Err(error) => {
+                    callback_error = Some(error);
+                    ConflictAction::SQLITE_CHANGESET_ABORT
+                }
+            },
+            flags,
+        );
+
+        match callback_error {
+            Some(error) => Err(SessionApplyError::Callback {
+                error,
+                sqlite: applied.err(),
+            }),
+            None => applied.map_err(SessionApplyError::Sqlite),
+        }
+    }
+
     fn apply_with_flags_impl<F, C>(
         &self,
         len: c_int,
@@ -1083,14 +1229,14 @@ impl Connection {
         F: FnMut(&str) -> bool,
         C: for<'a> FnMut(ConflictType, ChangesetItem<'a>) -> ConflictAction,
     {
-        let input_ref = &input;
+        let mut input = Stream::new(input);
         let db = self.db.borrow_mut().db;
         let mut output = RebaseBuffer {
             ptr: ptr::null_mut(),
             len: 0,
         };
 
-        self.with_apply_callbacks(
+        let result = self.with_apply_callbacks(
             filter,
             conflict,
             !flags.contains(ChangesetApplyFlags::NOSAVEPOINT),
@@ -1099,7 +1245,7 @@ impl Connection {
                     ffi::sqlite3changeset_apply_v2_strm(
                         db,
                         Some(x_input),
-                        input_ref as *const &mut dyn Read as *mut c_void,
+                        input.context(),
                         if filtered {
                             Some(call_filter::<F, C>)
                         } else {
@@ -1121,8 +1267,9 @@ impl Connection {
                     )
                 })
             },
-        )?;
+        );
 
+        stream_result(result, input.error)?;
         Ok(output.to_vec())
     }
 
@@ -1264,6 +1411,35 @@ where
     }
 }
 
+struct Stream<'a, T: ?Sized> {
+    io: &'a mut T,
+    error: Option<io::Error>,
+}
+impl<'a, T: ?Sized> Stream<'a, T> {
+    fn new(io: &'a mut T) -> Self {
+        Self { io, error: None }
+    }
+
+    fn context(&mut self) -> *mut c_void {
+        (self as *mut Self).cast()
+    }
+}
+
+fn stream_result<T>(result: Result<T>, error: Option<io::Error>) -> Result<T> {
+    match error {
+        Some(error) => {
+            let code = result
+                .as_ref()
+                .err()
+                .and_then(Error::sqlite_error)
+                .map_or(ffi::SQLITE_IOERR, |error| error.extended_code);
+
+            Err(Error::SessionIoFailure(ffi::Error::new(code), error))
+        }
+        None => result,
+    }
+}
+
 unsafe extern "C" fn x_input(p_in: *mut c_void, data: *mut c_void, len: *mut c_int) -> c_int {
     if p_in.is_null() {
         return ffi::SQLITE_MISUSE;
@@ -1278,13 +1454,24 @@ unsafe extern "C" fn x_input(p_in: *mut c_void, data: *mut c_void, len: *mut c_i
         }
 
         let bytes: &mut [u8] = from_raw_parts_mut(data as *mut u8, *len);
-        let input = p_in as *mut &mut dyn Read;
-        match catch_unwind(std::panic::AssertUnwindSafe(|| (*input).read(bytes))) {
+        let input = p_in.cast::<Stream<'_, dyn Read>>();
+        match catch_unwind(std::panic::AssertUnwindSafe(|| (*input).io.read(bytes))) {
             Ok(Ok(n)) if n <= bytes.len() => {
                 *len = n as c_int;
                 ffi::SQLITE_OK
             }
-            Ok(Ok(_)) | Ok(Err(_)) | Err(_) => ffi::SQLITE_IOERR_READ,
+            Ok(Ok(_)) => {
+                (*input).error = Some(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "changeset reader returned more bytes than its buffer",
+                ));
+                ffi::SQLITE_IOERR_READ
+            }
+            Ok(Err(error)) => {
+                (*input).error = Some(error);
+                ffi::SQLITE_IOERR_READ
+            }
+            Err(_) => ffi::SQLITE_IOERR_READ,
         }
     }
 }
@@ -1297,10 +1484,16 @@ unsafe extern "C" fn x_output(p_out: *mut c_void, data: *const c_void, len: c_in
         // The sessions module never invokes an xOutput callback with the third
         // parameter set to a value less than or equal to zero.
         let bytes: &[u8] = from_raw_parts(data as *const u8, len);
-        let output = p_out as *mut &mut dyn Write;
-        match catch_unwind(std::panic::AssertUnwindSafe(|| (*output).write_all(bytes))) {
+        let output = p_out.cast::<Stream<'_, dyn Write>>();
+        match catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (*output).io.write_all(bytes)
+        })) {
             Ok(Ok(())) => ffi::SQLITE_OK,
-            Ok(Err(_)) | Err(_) => ffi::SQLITE_IOERR_WRITE,
+            Ok(Err(error)) => {
+                (*output).error = Some(error);
+                ffi::SQLITE_IOERR_WRITE
+            }
+            Err(_) => ffi::SQLITE_IOERR_WRITE,
         }
     }
 }
@@ -1582,6 +1775,124 @@ mod test {
     }
 
     #[test]
+    fn foreign_key_row() -> Result<()> {
+        let schema = "CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                      CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));";
+        let source = Connection::open_in_memory()?;
+        source.execute_batch("PRAGMA foreign_keys=OFF")?;
+        source.execute_batch(schema)?;
+        let mut session = Session::new(&source)?;
+        session.attach(Some("child"))?;
+        source.execute("INSERT INTO child VALUES (1, 99)", [])?;
+        let changeset = session.changeset()?;
+
+        let target = Connection::open_in_memory()?;
+        target.execute_batch("PRAGMA foreign_keys=ON")?;
+        target.execute_batch(schema)?;
+        let mut rejected = false;
+        target
+            .apply(&changeset, None::<fn(&str) -> bool>, |_, item| {
+                rejected = item.to_owned().is_err() && item.pk().is_err();
+                ConflictAction::SQLITE_CHANGESET_ABORT
+            })
+            .unwrap_err();
+
+        assert!(rejected);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_row() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo(id INTEGER PRIMARY KEY, text TEXT)")?;
+        let mut session = Session::new(&db)?;
+        session.attach(Some("foo"))?;
+        db.execute("INSERT INTO foo VALUES (1, NULL)", [])?;
+        let changeset = session.changeset()?;
+        let owned = changeset.iter()?.next()?.unwrap().to_owned()?;
+
+        assert_eq!(
+            owned.new,
+            [Some(super::Value::Integer(1)), Some(super::Value::Null)]
+        );
+
+        let changeset = one_changeset_update()?;
+        let owned = changeset.iter()?.next()?.unwrap().to_owned()?;
+        assert!(owned.new[0].is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn writer_error() -> Result<()> {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::PermissionDenied.into())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let bytes = one_changeset_strm()?;
+        let error = super::invert_strm(&mut bytes.as_slice(), &mut FailingWriter).unwrap_err();
+        let crate::Error::SessionIoFailure(_, error) = error else {
+            panic!("original writer error was lost");
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        Ok(())
+    }
+
+    #[test]
+    fn reader_error() -> Result<()> {
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::PermissionDenied.into())
+            }
+        }
+
+        let mut input = FailingReader;
+        let mut iter = ChangesetIter::start_strm(&mut input)?;
+        let Err(error) = iter.next() else {
+            panic!("reader failure was ignored");
+        };
+        let crate::Error::SessionIoFailure(_, error) = error else {
+            panic!("original reader error was lost");
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        Ok(())
+    }
+
+    #[test]
+    fn fallible_conflict() -> Result<()> {
+        let bytes = one_changeset_strm()?;
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE foo(t TEXT PRIMARY KEY); INSERT INTO foo VALUES ('bar')")?;
+        let error = db
+            .apply_bytes_try(
+                &bytes,
+                None::<fn(&str) -> bool>,
+                |_, _| Err(vec![17_u8]),
+                ChangesetApplyFlags::empty(),
+            )
+            .unwrap_err();
+        let super::SessionApplyError::Callback {
+            error,
+            sqlite: Some(_),
+        } = error
+        else {
+            panic!("original callback error or SQLite error was lost");
+        };
+
+        assert_eq!(error, [17]);
+        Ok(())
+    }
+
+    #[test]
     fn test_changeset_reader_length() {
         struct Oversized;
         impl Read for Oversized {
@@ -1591,17 +1902,12 @@ mod test {
         }
 
         let mut reader = Oversized;
-        let mut input: &mut dyn Read = &mut reader;
+        let mut input = super::Stream::new(&mut reader as &mut dyn Read);
         let mut bytes = [0_u8; 8];
         let mut len = 8;
 
-        let result = unsafe {
-            super::x_input(
-                (&mut input as *mut &mut dyn Read).cast(),
-                bytes.as_mut_ptr().cast(),
-                &mut len,
-            )
-        };
+        let result =
+            unsafe { super::x_input(input.context(), bytes.as_mut_ptr().cast(), &mut len) };
         assert_eq!(result, crate::ffi::SQLITE_IOERR_READ);
     }
 

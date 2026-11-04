@@ -43,6 +43,16 @@ pub enum Error {
     /// be converted to the requested Rust type.
     FromSqlConversionFailure(usize, Type, Box<dyn error::Error + Send + Sync + 'static>),
 
+    /// A column conversion failed, including its name and requested Rust type.
+    ColumnConversionFailure(Box<crate::row::ColumnError>),
+
+    /// A value conversion failed outside a row, where column context is unavailable.
+    ValueConversionFailure(FromSqlError),
+
+    /// A session streaming callback failed with its original I/O error.
+    #[cfg(feature = "session")]
+    SessionIoFailure(ffi::Error, std::io::Error),
+
     /// Error when SQLite gives us an integral value outside the range of the
     /// requested type (e.g., trying to get the value 1000 into a `u8`).
     /// The associated `usize` is the column index,
@@ -160,6 +170,8 @@ pub enum Error {
 impl PartialEq for Error {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::ValueConversionFailure(a), Self::ValueConversionFailure(b)) => a == b,
+            (Self::ColumnConversionFailure(a), Self::ColumnConversionFailure(b)) => a == b,
             (Self::SqliteFailure(e1, s1), Self::SqliteFailure(e2, s2)) => e1 == e2 && s1 == s2,
             (Self::SqliteSingleThreadedMode, Self::SqliteSingleThreadedMode) => true,
             (Self::IntegralValueOutOfRange(i1, n1), Self::IntegralValueOutOfRange(i2, n2)) => {
@@ -218,7 +230,7 @@ impl PartialEq for Error {
 impl From<str::Utf8Error> for Error {
     #[cold]
     fn from(err: str::Utf8Error) -> Self {
-        Self::Utf8Error(UNKNOWN_COLUMN, err)
+        Self::ValueConversionFailure(FromSqlError::Utf8Error(err))
     }
 }
 
@@ -231,23 +243,11 @@ impl From<NulError> for Error {
 
 const UNKNOWN_COLUMN: usize = usize::MAX;
 
-/// The conversion isn't precise, but it's convenient to have it
-/// to allow use of `get_raw(…).as_…()?` in callbacks that take `Error`.
+/// Preserve value conversion errors that have no column context.
 impl From<FromSqlError> for Error {
     #[cold]
     fn from(err: FromSqlError) -> Self {
-        // The error type requires index and type fields, but they aren't known in this
-        // context.
-        match err {
-            FromSqlError::OutOfRange(val) => Self::IntegralValueOutOfRange(UNKNOWN_COLUMN, val),
-            FromSqlError::InvalidBlobSize { .. } => {
-                Self::FromSqlConversionFailure(UNKNOWN_COLUMN, Type::Blob, Box::new(err))
-            }
-            FromSqlError::Other(source) => {
-                Self::FromSqlConversionFailure(UNKNOWN_COLUMN, Type::Null, source)
-            }
-            _ => Self::FromSqlConversionFailure(UNKNOWN_COLUMN, Type::Null, Box::new(err)),
-        }
+        Self::ValueConversionFailure(err)
     }
 }
 
@@ -262,6 +262,10 @@ impl From<ffi::InitError> for Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
+            Self::ColumnConversionFailure(ref error) => error.fmt(f),
+            Self::ValueConversionFailure(ref error) => error.fmt(f),
+            #[cfg(feature = "session")]
+            Self::SessionIoFailure(ref sqlite, ref source) => write!(f, "{sqlite}: {source}"),
             Self::SqliteFailure(ref err, None) => err.fmt(f),
             Self::SqliteFailure(_, Some(ref s)) => write!(f, "{s}"),
             Self::SqliteSingleThreadedMode => write!(
@@ -343,6 +347,10 @@ impl fmt::Display for Error {
 impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match *self {
+            Self::ColumnConversionFailure(ref error) => Some(&**error),
+            Self::ValueConversionFailure(ref error) => Some(error),
+            #[cfg(feature = "session")]
+            Self::SessionIoFailure(_, ref source) => Some(source),
             Self::SqliteFailure(ref err, _) => Some(err),
             Self::Utf8Error(_, ref err) => Some(err),
             Self::NulError(ref err) => Some(err),
@@ -390,26 +398,27 @@ impl error::Error for Error {
 }
 
 impl Error {
-    /// Returns the underlying SQLite error if this is [`Error::SqliteFailure`].
+    /// Returns the underlying SQLite error for a SQLite failure or a session
+    /// streaming I/O failure.
     #[inline]
     #[must_use]
     pub fn sqlite_error(&self) -> Option<&ffi::Error> {
         match self {
             Self::SqliteFailure(error, _) => Some(error),
+            #[cfg(feature = "session")]
+            Self::SessionIoFailure(error, _) => Some(error),
             _ => None,
         }
     }
 
-    /// Returns the underlying SQLite error code if this is
-    /// [`Error::SqliteFailure`].
+    /// Returns the error code from [`Error::sqlite_error`], when available.
     #[inline]
     #[must_use]
     pub fn sqlite_error_code(&self) -> Option<ffi::ErrorCode> {
         self.sqlite_error().map(|error| error.code)
     }
 
-    /// Returns the underlying SQLite extended error code if this is
-    /// [`Error::SqliteFailure`].
+    /// Returns the extended error code from [`Error::sqlite_error`], when available.
     #[inline]
     #[must_use]
     pub fn sqlite_extended_error_code(&self) -> Option<c_int> {

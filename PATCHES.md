@@ -1,6 +1,6 @@
 # Fork patches
 
-This fork adds savepoint and session APIs, plus fixes for callbacks, streaming input, cached statements, library selection, and timestamp parsing. Related changes stay grouped in a few commits on the `fork` branch.
+This fork adds query, transaction, and session helpers, plus fixes for conversion errors, callbacks, streaming input, cached statements, library selection, and timestamp parsing. Related changes stay grouped in a few commits on the `fork` branch.
 
 The upstream base is rusqlite/rusqlite commit 84beed6601ec2e261fea83c07834f5d861a9884a. Codec bindings and rarray rowid ordering are already part of that base. The patches here carry forward the earlier `extras` branch and include the streaming reader fix from the Snak vendored copy.
 
@@ -104,3 +104,41 @@ Bundled native SQLite includes the upstream [535a77cf5a fix](https://github.com/
 ### Invalid timestamps
 
 Reading an `OffsetDateTime` with the `time` feature returns a conversion error for malformed text, including short strings and Unicode at the date boundary. It no longer panics while looking for a timezone offset.
+
+## Query, conversion, and callback errors
+
+### Query helpers
+
+`Connection::query_all` collects decoded rows. `query_first` reads and decodes only the first row, returning `None` for an empty result. Both accept a normal fallible decoder with any error type, with no required conversion into a rusqlite error.
+
+`QueryError<E>` keeps SQLite failures and decoder failures distinct, retains the SQL, and identifies a failed decoder's result row. The original decoder error stays in its `Decode` variant. Both helpers use the statement cache when the `cache` feature is enabled.
+
+The new query, transaction, and fallible apply helpers accept any callback error value. Their error wrappers implement `std::error::Error` when that value does. Containers such as `anyhow::Error`, boxed trait objects, and er trees need explicit variant handling to recover their original errors. These APIs do not add a dependency on any error crate or automatically bridge its reporting system.
+
+For existing rusqlite decoders, `execute_cached`, `query_row_cached`, and `query_one_cached` provide cached versions of the usual connection helpers. Ordinary `execute` and `query_row` keep their existing preparation behavior.
+
+### Column context
+
+`Row::get` conversion errors now use `Error::ColumnConversionFailure`. Its `ColumnError` records the column index, name, stored SQLite type, requested Rust type, and original conversion error. The original parser error remains reachable through the standard source chain.
+
+Code matching the old conversion variants from `Row::get` should inspect `ColumnError::source` instead. Column name and index lookup errors are unchanged. Conversions outside a row use `Error::ValueConversionFailure`, so missing context is no longer represented by a fake column index or SQL NULL type.
+
+`types::from_sql_try` reads an existing SQL representation and applies `TryFrom`, simplifying validated newtypes. `FromSqlError::other` also accepts an existing boxed error without boxing it again.
+
+### Session callbacks and owned rows
+
+Streaming operations retain their original I/O errors in `Error::SessionIoFailure`, including failures encountered after starting a streaming iterator. The SQLite error code is retained too.
+
+`Connection::apply_bytes_try` accepts a conflict callback returning `Result<ConflictAction, E>`. A callback error aborts the apply and returns the original value alongside SQLite's outcome in `SessionApplyError<E>`. The callback error can be any type.
+
+`ChangesetItem::to_owned` copies row metadata, primary key flags, and old/new values into an `OwnedChangesetRow`. Absent update fields stay distinct from SQL NULL. A foreign key conflict has no row to copy and returns an error.
+
+### Scoped transactions and savepoints
+
+`Connection::with_transaction` runs a fallible operation with the requested transaction behavior, including `Immediate`. `with_savepoint` supports nested operations through a shared connection. Both accept any callback error type. `TransactionError<E>` preserves the original failure, rollback and release failures, and the final autocommit state. A failed rollback skips savepoint release so cleanup cannot accidentally commit the failed operation.
+
+Explicit transaction and savepoint `finish` calls retain a failed commit error even when rollback succeeds. They no longer make a second hidden cleanup attempt through Drop after reporting their result.
+
+### Encryption methods
+
+With the `codec` feature, `Connection::set_key` and `rekey` provide distinct methods for installing and changing an encryption key. The earlier `key` method with its boolean argument remains available.

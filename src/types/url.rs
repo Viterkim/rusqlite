@@ -45,6 +45,8 @@ mod test {
 
     #[test]
     fn test_sql_url() -> Result<()> {
+        use std::error::Error as _;
+
         let db = &checked_memory_handle()?;
 
         let url0 = Url::parse("http://www.example1.com").unwrap();
@@ -70,10 +72,10 @@ mod test {
         // Make sure the conversion error comes through correctly.
         let err = get_url(db, 3).unwrap_err();
         match err {
-            Error::FromSqlConversionFailure(_, _, e) => {
+            Error::ColumnConversionFailure(error) => {
                 assert_eq!(
-                    *e.downcast::<ParseError>().unwrap(),
-                    ParseError::RelativeUrlWithoutBase,
+                    error.source.source().unwrap().downcast_ref::<ParseError>(),
+                    Some(&ParseError::RelativeUrlWithoutBase),
                 );
             }
             e => {

@@ -6,6 +6,16 @@ use crate::ffi;
 use crate::{Connection, Name, Result};
 
 impl Connection {
+    /// Set the encryption key before reading from the selected database.
+    pub fn set_key<N: Name, S: AsRef<[u8]>>(&self, db_name: Option<N>, key: S) -> Result<()> {
+        self.key(db_name, key, false)
+    }
+
+    /// Change the encryption key of an already open database.
+    pub fn rekey<N: Name, S: AsRef<[u8]>>(&self, db_name: Option<N>, key: S) -> Result<()> {
+        self.key(db_name, key, true)
+    }
+
     /// Specify the key for an encrypted database.
     /// Or Change the key on an open database with `rekey`.
     pub fn key<N: Name, S: AsRef<[u8]>>(

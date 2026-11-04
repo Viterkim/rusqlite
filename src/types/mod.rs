@@ -16,12 +16,16 @@
 //! the value.
 //!
 //! * `INTEGER` to integer: returns an
-//!   [`Error::IntegralValueOutOfRange`](crate::Error::IntegralValueOutOfRange)
+//!   [`FromSqlError::OutOfRange`]
 //!   error if the value does not fit in the Rust type.
 //! * `REAL` to integer: always returns an
-//!   [`Error::InvalidColumnType`](crate::Error::InvalidColumnType) error.
+//!   [`FromSqlError::InvalidType`] error.
 //! * `INTEGER` to float: casts using `as` operator. Never fails.
 //! * `REAL` to float: casts using `as` operator. Never fails.
+//!
+//! [`Row::get`](crate::Row::get) wraps conversion failures in
+//! [`Error::ColumnConversionFailure`](crate::Error::ColumnConversionFailure),
+//! adding the column name, index, SQLite type, and requested Rust type.
 //!
 //! [`ToSql`] always succeeds except when storing a `u64` or `usize` value that
 //! cannot fit in an `INTEGER` (`i64`). Also note that SQLite ignores column
@@ -70,7 +74,7 @@ impl ToSql for DateTimeSql {
 //! implements [`ToSql`] or [`FromSql`] for the cases where you want to know if
 //! a value was NULL (which gets translated to `None`).
 
-pub use self::from_sql::{FromSql, FromSqlError, FromSqlResult};
+pub use self::from_sql::{FromSql, FromSqlError, FromSqlResult, from_sql_try};
 #[cfg(any(feature = "functions", feature = "vtab"))]
 pub use self::raw_value::{RawValue, ValueIter, Values};
 pub use self::to_sql::{ToSql, ToSqlOutput};
@@ -247,7 +251,12 @@ mod test {
     #[expect(clippy::cognitive_complexity)]
     fn test_mismatched_types() -> Result<()> {
         fn is_invalid_column_type(err: Error) -> bool {
-            matches!(err, Error::InvalidColumnType(..))
+            match err {
+                Error::ColumnConversionFailure(error) => {
+                    error.source == super::FromSqlError::InvalidType
+                }
+                _ => false,
+            }
         }
 
         let db = checked_memory_handle()?;

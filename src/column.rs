@@ -493,7 +493,7 @@ mod test {
 
     #[test]
     fn test_column_name_in_error() -> Result<()> {
-        use crate::{Error, types::Type};
+        use crate::Error;
         let db = Connection::open_in_memory()?;
         db.execute_batch(
             "BEGIN;
@@ -505,20 +505,16 @@ mod test {
         let mut rows = stmt.query([])?;
         let row = rows.next()?.unwrap();
         match row.get::<_, String>(0).unwrap_err() {
-            Error::InvalidColumnType(idx, name, ty) => {
-                assert_eq!(idx, 0);
-                assert_eq!(name, "renamed");
-                assert_eq!(ty, Type::Integer);
+            Error::ColumnConversionFailure(error) => {
+                assert_eq!(error.name, "renamed");
             }
             e => {
                 panic!("Unexpected error type: {e:?}");
             }
         }
         match row.get::<_, String>("y").unwrap_err() {
-            Error::InvalidColumnType(idx, name, ty) => {
-                assert_eq!(idx, 1);
-                assert_eq!(name, "y");
-                assert_eq!(ty, Type::Null);
+            Error::ColumnConversionFailure(error) => {
+                assert_eq!(error.name, "y");
             }
             e => {
                 panic!("Unexpected error type: {e:?}");

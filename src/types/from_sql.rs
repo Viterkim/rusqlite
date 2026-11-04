@@ -33,14 +33,11 @@ pub enum FromSqlError {
 }
 
 impl FromSqlError {
-    /// Converts an arbitrary error type to [`FromSqlError`].
+    /// Wrap a custom conversion error, reusing an existing box when supplied.
     ///
-    /// This is a convenience function that boxes and unsizes the error type. It's main purpose is
-    /// to be usable in the `map_err` method. So instead of
-    /// `result.map_err(|error| FromSqlError::Other(Box::new(error))` you can write
-    /// `result.map_err(FromSqlError::other)`.
-    pub fn other<E: Error + Send + Sync + 'static>(error: E) -> Self {
-        Self::Other(Box::new(error))
+    /// Use `result.map_err(FromSqlError::other)` to keep its source.
+    pub fn other<E: Into<Box<dyn Error + Send + Sync + 'static>>>(error: E) -> Self {
+        Self::Other(error.into())
     }
 }
 
@@ -109,6 +106,18 @@ pub type FromSqlResult<T> = Result<T, FromSqlError>;
 pub trait FromSql: Sized {
     /// Converts SQLite value into Rust value.
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self>;
+}
+
+/// Read an existing SQL representation, then validate it with [`TryFrom`].
+///
+/// A custom [`FromSql`] implementation can use `from_sql_try::<String, Self>(value)`.
+pub fn from_sql_try<S, T>(value: ValueRef<'_>) -> FromSqlResult<T>
+where
+    S: FromSql,
+    T: TryFrom<S>,
+    T::Error: Into<Box<dyn Error + Send + Sync + 'static>>,
+{
+    T::try_from(S::column_result(value)?).map_err(FromSqlError::other)
 }
 
 macro_rules! from_sql_integral(
@@ -316,11 +325,28 @@ mod test {
     #[cfg(all(target_family = "wasm", target_os = "unknown"))]
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
-    use super::{FromSql, FromSqlError};
+    use super::{FromSql, FromSqlError, ValueRef, from_sql_try};
     use crate::{Connection, Error, Result};
     use std::borrow::Cow;
+    use std::error::Error as StdError;
+    use std::num::{ParseIntError, TryFromIntError};
     use std::rc::Rc;
     use std::sync::Arc;
+
+    #[test]
+    fn boxed_error() {
+        let source: Box<dyn StdError + Send + Sync> = "bad".parse::<i64>().unwrap_err().into();
+        let error = FromSqlError::other(source);
+
+        assert!(error.source().unwrap().is::<ParseIntError>());
+    }
+
+    #[test]
+    fn try_conversion() {
+        let error = from_sql_try::<i64, u8>(ValueRef::Integer(256)).unwrap_err();
+
+        assert!(error.source().unwrap().is::<TryFromIntError>());
+    }
 
     #[test]
     #[cfg_attr(miri, ignore)]
@@ -336,7 +362,9 @@ mod test {
                     .query_row("SELECT ?1", [n], |r| r.get::<_, T>(0))
                     .unwrap_err();
                 match err {
-                    Error::IntegralValueOutOfRange(_, value) => assert_eq!(*n, value),
+                    Error::ColumnConversionFailure(error) => {
+                        assert_eq!(error.source, FromSqlError::OutOfRange(*n));
+                    }
                     _ => panic!("unexpected error: {err}"),
                 }
             }
@@ -371,12 +399,15 @@ mod test {
         macro_rules! check_ranges {
             ($nz:ty, $out_of_range:expr, $in_range:expr) => {
                 for &n in $out_of_range {
-                    assert_eq!(
-                        db.query_row("SELECT ?1", [n], |r| r.get::<_, $nz>(0)),
-                        Err(Error::IntegralValueOutOfRange(0, n)),
-                        "{}",
-                        std::any::type_name::<$nz>()
-                    );
+                    let error = db
+                        .query_row("SELECT ?1", [n], |r| r.get::<_, $nz>(0))
+                        .unwrap_err();
+                    match error {
+                        Error::ColumnConversionFailure(error) => {
+                            assert_eq!(error.source, FromSqlError::OutOfRange(n));
+                        }
+                        error => panic!("unexpected error: {error}"),
+                    }
                 }
                 for &n in $in_range {
                     let non_zero = <$nz>::new(n).unwrap();

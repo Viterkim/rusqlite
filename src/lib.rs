@@ -98,10 +98,12 @@ pub use crate::ffi::ErrorCode;
 #[cfg(feature = "load_extension")]
 pub use crate::load_extension_guard::LoadExtensionGuard;
 pub use crate::params::{Params, ParamsFromIter, params_from_iter};
-pub use crate::row::{AndThenRows, Map, MappedRows, Row, RowIndex, Rows};
+pub use crate::query::QueryError;
+pub use crate::row::{AndThenRows, ColumnError, Map, MappedRows, Row, RowIndex, Rows};
 pub use crate::statement::{Statement, StatementStatus};
 pub use crate::transaction::TransactionState;
 pub use crate::transaction::{DropBehavior, Savepoint, Transaction, TransactionBehavior};
+pub use crate::transaction::{TransactionError, TransactionFailure};
 pub use crate::types::ToSql;
 pub use crate::util::Name;
 pub use crate::version::*;
@@ -111,6 +113,8 @@ pub use rusqlite_macros::__bind;
 
 #[macro_use]
 mod error;
+
+pub mod query;
 
 #[cfg(not(feature = "loadable_extension"))]
 pub mod auto_extension;
@@ -2167,7 +2171,7 @@ mod test {
             let bad_type: Result<Vec<f64>> = query.query_and_then([], |row| row.get(1))?.collect();
 
             match bad_type.unwrap_err() {
-                Error::InvalidColumnType(..) => (),
+                Error::ColumnConversionFailure(..) => (),
                 err => panic!("Unexpected error {err}"),
             }
 
@@ -2220,7 +2224,7 @@ mod test {
                 .collect();
 
             match bad_type.unwrap_err() {
-                CustomError::Sqlite(Error::InvalidColumnType(..)) => (),
+                CustomError::Sqlite(Error::ColumnConversionFailure(..)) => (),
                 err => panic!("Unexpected error {err}"),
             }
 
@@ -2275,7 +2279,7 @@ mod test {
                 db.query_row_and_then(query, [], |row| row.get(1).map_err(CustomError::Sqlite));
 
             match bad_type.unwrap_err() {
-                CustomError::Sqlite(Error::InvalidColumnType(..)) => (),
+                CustomError::Sqlite(Error::ColumnConversionFailure(..)) => (),
                 err => panic!("Unexpected error {err}"),
             }
 

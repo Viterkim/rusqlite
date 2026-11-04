@@ -1,9 +1,12 @@
 use fallible_iterator::FallibleIterator;
 use fallible_streaming_iterator::FallibleStreamingIterator;
+use std::any::type_name;
 use std::convert;
+use std::error::Error as StdError;
+use std::fmt;
 
 use super::{Error, Result, Statement};
-use crate::types::{FromSql, FromSqlError, ValueRef};
+use crate::types::{FromSql, FromSqlError, Type, ValueRef};
 
 /// A handle (lazy fallible streaming iterator) for the resulting rows of a query.
 #[must_use = "Rows is lazy and will do nothing unless consumed"]
@@ -242,6 +245,35 @@ impl<'stmt> FallibleStreamingIterator for Rows<'stmt> {
     }
 }
 
+/// A failed conversion with the column and requested Rust type attached.
+#[derive(Debug, PartialEq)]
+pub struct ColumnError {
+    /// Index of the column in the result row.
+    pub index: usize,
+    /// Name of the column in the result row.
+    pub name: String,
+    /// SQLite type of the stored value.
+    pub sql_type: Type,
+    /// Rust type requested by the caller.
+    pub rust_type: &'static str,
+    /// Original conversion failure.
+    pub source: FromSqlError,
+}
+impl fmt::Display for ColumnError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Cannot read column {:?} at index {} as {} from SQLite {}: {}",
+            self.name, self.index, self.rust_type, self.sql_type, self.source
+        )
+    }
+}
+impl StdError for ColumnError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// A single result row of a query.
 pub struct Row<'stmt> {
     pub(crate) stmt: &'stmt Statement<'stmt>,
@@ -269,36 +301,26 @@ impl Row<'_> {
     ///
     /// ## Failure
     ///
-    /// Returns an `Error::InvalidColumnType` if the underlying SQLite column
-    /// type is not a valid type as a source for `T`.
+    /// Conversion failures return [`Error::ColumnConversionFailure`] with the
+    /// column name, index, stored SQLite type, requested Rust type, and source.
     ///
     /// Returns an `Error::InvalidColumnIndex` if `idx` is outside the valid
     /// column range for this row.
     ///
     /// Returns an `Error::InvalidColumnName` if `idx` is not a valid column
     /// name for this row.
-    ///
-    /// If the result type is i128 (which requires the `i128_blob` feature to be
-    /// enabled), and the underlying SQLite column is a blob whose size is not
-    /// 16 bytes, `Error::InvalidColumnType` will also be returned.
     #[track_caller]
     pub fn get<I: RowIndex, T: FromSql>(&self, idx: I) -> Result<T> {
         let idx = idx.idx(self.stmt)?;
         let value = self.stmt.value_ref(idx);
-        FromSql::column_result(value).map_err(|err| match err {
-            FromSqlError::InvalidType => Error::InvalidColumnType(
-                idx,
-                self.stmt.column_name_unwrap(idx).into(),
-                value.data_type(),
-            ),
-            FromSqlError::OutOfRange(i) => Error::IntegralValueOutOfRange(idx, i),
-            FromSqlError::Utf8Error(err) => Error::Utf8Error(idx, err),
-            FromSqlError::Other(err) => {
-                Error::FromSqlConversionFailure(idx, value.data_type(), err)
-            }
-            FromSqlError::InvalidBlobSize { .. } => {
-                Error::FromSqlConversionFailure(idx, value.data_type(), Box::new(err))
-            }
+        FromSql::column_result(value).map_err(|source| {
+            Error::ColumnConversionFailure(Box::new(ColumnError {
+                index: idx,
+                name: self.stmt.column_name_unwrap(idx).into(),
+                sql_type: value.data_type(),
+                rust_type: type_name::<T>(),
+                source,
+            }))
         })
     }
 
@@ -491,6 +513,21 @@ mod tests {
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
     use crate::{Connection, Result};
+
+    #[test]
+    fn column_context() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        let error = db
+            .query_row("SELECT 256 AS port", [], |row| row.get::<_, u8>(0))
+            .unwrap_err();
+        let crate::Error::ColumnConversionFailure(error) = error else {
+            panic!("missing column context");
+        };
+
+        assert_eq!(error.name, "port");
+        assert_eq!(error.rust_type, std::any::type_name::<u8>());
+        Ok(())
+    }
 
     #[test]
     fn test_try_from_row_for_tuple_1() -> Result<()> {

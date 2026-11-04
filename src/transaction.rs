@@ -1,5 +1,7 @@
 use crate::pragma::Sql;
-use crate::{Connection, Result};
+use crate::{Connection, Error, Result};
+use std::error;
+use std::fmt;
 use std::ops::Deref;
 
 /// Options for transaction behavior. See [BEGIN
@@ -94,6 +96,62 @@ pub struct Savepoint<'conn> {
     name: String,
     drop_behavior: DropBehavior,
     committed: bool,
+}
+
+/// The operation that failed inside a scoped transaction or savepoint.
+#[derive(Debug)]
+pub enum TransactionFailure<E> {
+    /// Opening the transaction or savepoint failed.
+    Begin(Error),
+    /// The callback returned its own error.
+    Operation(E),
+    /// Committing the transaction or releasing its savepoint failed.
+    Commit(Error),
+}
+
+/// A scoped transaction or savepoint failure together with cleanup failures.
+///
+/// Callback errors have no trait bounds. This wrapper implements
+/// [`std::error::Error`] when `E` does. Its public fields also allow callers to
+/// handle other error containers without converting their original values.
+#[derive(Debug)]
+pub struct TransactionError<E> {
+    /// The original failure.
+    pub cause: TransactionFailure<E>,
+    /// Failure while rolling back changes after the original failure.
+    pub rollback_error: Option<Box<Error>>,
+    /// Failure while releasing a rolled back savepoint, unused for transactions.
+    pub release_error: Option<Box<Error>>,
+    /// Whether the connection is in autocommit mode after cleanup.
+    pub is_autocommit: bool,
+}
+impl<E: fmt::Display> fmt::Display for TransactionError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.cause {
+            TransactionFailure::Begin(error) => write!(f, "Could not begin transaction: {error}"),
+            TransactionFailure::Operation(error) => {
+                write!(f, "Transaction operation failed: {error}")
+            }
+            TransactionFailure::Commit(error) => write!(f, "Could not commit transaction: {error}"),
+        }?;
+
+        if let Some(error) = &self.rollback_error {
+            write!(f, ", rollback failed: {error}")?;
+        }
+        if let Some(error) = &self.release_error {
+            write!(f, ", release failed: {error}")?;
+        }
+
+        Ok(())
+    }
+}
+impl<E: error::Error + 'static> error::Error for TransactionError<E> {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match &self.cause {
+            TransactionFailure::Begin(error) | TransactionFailure::Commit(error) => Some(error),
+            TransactionFailure::Operation(error) => Some(error),
+        }
+    }
 }
 
 impl Transaction<'_> {
@@ -213,7 +271,9 @@ impl Transaction<'_> {
     /// callers to see any errors that occur.
     #[inline]
     pub fn finish(mut self) -> Result<()> {
-        self.finish_()
+        let result = self.finish_();
+        self.drop_behavior = DropBehavior::Ignore;
+        result
     }
 
     #[inline]
@@ -222,7 +282,14 @@ impl Transaction<'_> {
             return Ok(());
         }
         match self.drop_behavior() {
-            DropBehavior::Commit => self.commit_().or_else(|_| self.rollback_()),
+            DropBehavior::Commit => {
+                let result = self.commit_();
+                if result.is_err() {
+                    let _ = self.rollback_();
+                }
+
+                result
+            }
             DropBehavior::Rollback => self.rollback_(),
             DropBehavior::Ignore => Ok(()),
             DropBehavior::Panic => panic!("Transaction dropped unexpectedly."),
@@ -358,7 +425,9 @@ impl Savepoint<'_> {
     /// callers to see any errors that occur.
     #[inline]
     pub fn finish(mut self) -> Result<()> {
-        self.finish_()
+        let result = self.finish_();
+        self.drop_behavior = DropBehavior::Ignore;
+        result
     }
 
     #[inline]
@@ -367,9 +436,14 @@ impl Savepoint<'_> {
             return Ok(());
         }
         match self.drop_behavior() {
-            DropBehavior::Commit => self
-                .commit_()
-                .or_else(|_| self.rollback().and_then(|()| self.commit_())),
+            DropBehavior::Commit => {
+                let result = self.commit_();
+                if result.is_err() {
+                    let _ = self.rollback().and_then(|()| self.commit_());
+                }
+
+                result
+            }
             DropBehavior::Rollback => self.rollback().and_then(|()| self.commit_()),
             DropBehavior::Ignore => Ok(()),
             DropBehavior::Panic => panic!("Savepoint dropped unexpectedly."),
@@ -465,6 +539,50 @@ impl Connection {
         Transaction::new(self, behavior)
     }
 
+    /// Run an operation inside a transaction with the requested behavior.
+    ///
+    /// Success commits the transaction. A callback or commit failure attempts
+    /// rollback and returns both the original failure and any rollback error,
+    /// together with the final connection state.
+    pub fn with_transaction<T, E, F>(
+        &mut self,
+        behavior: TransactionBehavior,
+        operation: F,
+    ) -> Result<T, TransactionError<E>>
+    where
+        F: FnOnce(&Connection) -> Result<T, E>,
+    {
+        let mut transaction =
+            Transaction::new_unchecked(self, behavior).map_err(|error| TransactionError {
+                cause: TransactionFailure::Begin(error),
+                rollback_error: None,
+                release_error: None,
+                is_autocommit: self.is_autocommit(),
+            })?;
+
+        let cause = match operation(&transaction) {
+            Ok(value) => match transaction.commit_() {
+                Ok(()) => return Ok(value),
+                Err(error) => TransactionFailure::Commit(error),
+            },
+            Err(error) => TransactionFailure::Operation(error),
+        };
+
+        let rollback_error = if self.is_autocommit() {
+            None
+        } else {
+            transaction.rollback_().err().map(Box::new)
+        };
+        transaction.set_drop_behavior(DropBehavior::Ignore);
+
+        Err(TransactionError {
+            cause,
+            rollback_error,
+            release_error: None,
+            is_autocommit: self.is_autocommit(),
+        })
+    }
+
     /// Begin a new transaction with the default behavior (DEFERRED).
     ///
     /// Attempt to open a nested transaction will result in a SQLite error.
@@ -540,6 +658,51 @@ impl Connection {
         Savepoint::new_unchecked(self)
     }
 
+    /// Run an operation inside a savepoint, releasing it on success.
+    ///
+    /// A callback or release failure rolls back the savepoint. The returned
+    /// error preserves the original failure, cleanup errors, and final
+    /// connection state. A failed rollback skips release so it cannot commit
+    /// the failed operation.
+    pub fn with_savepoint<T, E, F>(&self, operation: F) -> Result<T, TransactionError<E>>
+    where
+        F: FnOnce(&Connection) -> Result<T, E>,
+    {
+        let mut savepoint = self
+            .unchecked_savepoint()
+            .map_err(|error| TransactionError {
+                cause: TransactionFailure::Begin(error),
+                rollback_error: None,
+                release_error: None,
+                is_autocommit: self.is_autocommit(),
+            })?;
+
+        let cause = match operation(&savepoint) {
+            Ok(value) => match savepoint.commit_() {
+                Ok(()) => return Ok(value),
+                Err(error) => TransactionFailure::Commit(error),
+            },
+            Err(error) => TransactionFailure::Operation(error),
+        };
+
+        let mut rollback_error = None;
+        let mut release_error = None;
+        if !self.is_autocommit() {
+            match savepoint.rollback() {
+                Ok(()) => release_error = savepoint.commit_().err().map(Box::new),
+                Err(error) => rollback_error = Some(Box::new(error)),
+            }
+        }
+        savepoint.set_drop_behavior(DropBehavior::Ignore);
+
+        Err(TransactionError {
+            cause,
+            rollback_error,
+            release_error,
+            is_autocommit: self.is_autocommit(),
+        })
+    }
+
     /// Begin a new savepoint with a specified name.
     ///
     /// See [`savepoint`](Connection::savepoint).
@@ -604,7 +767,7 @@ mod test {
     #[cfg(all(target_family = "wasm", target_os = "unknown"))]
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
-    use super::DropBehavior;
+    use super::{DropBehavior, TransactionBehavior, TransactionFailure};
     use crate::{Connection, Error, Result};
 
     fn checked_memory_handle() -> Result<Connection> {
@@ -631,6 +794,79 @@ mod test {
             assert_eq!(2, tx.one_column::<i32, _>("SELECT SUM(x) FROM foo", [])?);
         }
         Ok(())
+    }
+
+    #[test]
+    fn failed_finish() -> Result<()> {
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);",
+        )?;
+
+        let mut transaction = db.transaction()?;
+        transaction.set_drop_behavior(DropBehavior::Commit);
+        transaction.execute("INSERT INTO child VALUES (42)", [])?;
+        transaction.finish().unwrap_err();
+
+        let mut savepoint = db.unchecked_savepoint()?;
+        savepoint.set_drop_behavior(DropBehavior::Commit);
+        savepoint.execute("INSERT INTO child VALUES (42)", [])?;
+        savepoint.finish().unwrap_err();
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_savepoint() -> Result<()> {
+        let db = checked_memory_handle()?;
+        let error = db
+            .with_savepoint(|conn| {
+                conn.execute("INSERT INTO foo VALUES (1)", [])
+                    .map_err(|_| 0_u8)?;
+
+                Err::<(), _>(42_u8)
+            })
+            .unwrap_err();
+
+        assert_matches!(error.cause, TransactionFailure::Operation(42));
+        assert_eq!(db.one_column::<i32, _>("SELECT count(*) FROM foo", [])?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_commit_error() -> Result<()> {
+        let mut db = Connection::open_in_memory()?;
+        db.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);",
+        )?;
+        let error = db
+            .with_transaction(TransactionBehavior::Immediate, |conn| {
+                conn.execute("INSERT INTO child VALUES (42)", [])
+            })
+            .unwrap_err();
+
+        assert_matches!(error.cause, TransactionFailure::Commit(_));
+        Ok(())
+    }
+
+    #[test]
+    fn savepoint_cleanup_error() -> Result<()> {
+        let db = checked_memory_handle()?;
+        db.execute_batch("BEGIN")?;
+        let error = db
+            .with_savepoint(|conn| {
+                conn.execute_batch("RELEASE _rusqlite_sp")
+                    .map_err(|_| 0_u8)?;
+
+                Err::<(), _>(42_u8)
+            })
+            .unwrap_err();
+
+        assert!(error.rollback_error.is_some());
+        db.execute_batch("ROLLBACK")
     }
     fn assert_nested_tx_error(e: Error) {
         assert_matches!(
