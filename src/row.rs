@@ -338,6 +338,19 @@ impl Row<'_> {
             .map_err(|source| self.conversion_error::<&[u8]>(idx, value.data_type(), source))
     }
 
+    /// Borrow a nullable BLOB column without copying its bytes.
+    ///
+    /// SQL NULL returns `None`. Other SQLite types return
+    /// [`Error::ColumnConversionFailure`], with the same column context as
+    /// [`Row::get`].
+    pub fn get_blob_opt<I: RowIndex>(&self, idx: I) -> Result<Option<&[u8]>> {
+        let idx = idx.idx(self.stmt)?;
+        let value = self.stmt.value_ref(idx);
+        value.as_blob_or_null().map_err(|source| {
+            self.conversion_error::<Option<&[u8]>>(idx, value.data_type(), source)
+        })
+    }
+
     /// Borrow a TEXT column as UTF-8 without copying it.
     ///
     /// Other SQLite types and invalid UTF-8 return

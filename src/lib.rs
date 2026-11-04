@@ -105,7 +105,7 @@ pub use crate::row::{AndThenRows, ColumnError, Map, MappedRows, Row, RowIndex, R
 pub use crate::statement::{Statement, StatementStatus};
 pub use crate::transaction::TransactionState;
 pub use crate::transaction::{DropBehavior, Savepoint, Transaction, TransactionBehavior};
-pub use crate::transaction::{TransactionError, TransactionFailure};
+pub use crate::transaction::{TransactionDecision, TransactionError, TransactionFailure};
 pub use crate::types::ToSql;
 pub use crate::util::Name;
 pub use crate::version::*;

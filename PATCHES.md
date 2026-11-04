@@ -139,6 +139,8 @@ Code matching the old conversion variants from `Row::get` should inspect `Column
 
 `Row::get_blob` and `get_text` borrow bytes or UTF-8 text without copying, while retaining the same column conversion context. Numeric parameter indices are checked before conversion to SQLite's integer type. SQLite error code accessors also cover `SqlInputError`.
 
+`Row::get_blob_opt` borrows a nullable BLOB, returning `None` for SQL NULL and preserving column context for invalid types. Callers can check byte limits before copying the value.
+
 Oversized column, database, and virtual table constraint indices cannot wrap around to another index. Blob seeks reject offsets that would overflow the old position calculation.
 
 ### Session callbacks and owned rows
@@ -158,6 +160,10 @@ Commit hook panics veto the commit, and progress handler panics interrupt the op
 ### Scoped transactions and savepoints
 
 `Connection::with_transaction` runs a fallible operation with the requested transaction behavior, including `Immediate`. `with_savepoint` supports nested operations through a shared connection. Both accept any callback error type. `TransactionError<E>` preserves the original failure, rollback and release failures, and the final autocommit state. A failed rollback skips savepoint release so cleanup cannot accidentally commit the failed operation.
+
+Transaction callbacks now receive `&Transaction`, which dereferences to `Connection` and allows helpers to require a transaction in their signatures. Explicit callbacks expecting `&Connection` need a closure or an updated signature.
+
+`with_transaction_decision` and `with_savepoint_decision` let the callback return `TransactionDecision::Commit(value)` or `Rollback(value)`. A rollback can return a normal domain result, such as rejected replay conflicts. Both decisions check cleanup before returning the value. For savepoints, `Commit` releases the savepoint and `Rollback` rolls back then releases it. The savepoint decision callback receives `&Savepoint`. The existing scope helpers delegate to these same completion paths.
 
 `TransactionError::rollback_attempted` distinguishes a successful rollback from skipped cleanup. `with_rollback_savepoint` always rolls back, including on callback success, and returns the callback's value only after rollback and release succeed. Cleanup failure after a successful callback uses `TransactionFailure::Cleanup`.
 
