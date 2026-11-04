@@ -3,6 +3,8 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::path::Path;
 use std::ptr;
 use std::str;
+#[cfg(feature = "hooks")]
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use super::ffi;
@@ -21,6 +23,8 @@ pub struct InnerConnection {
     // Otherwise, a long-running query would prevent calling interrupt, as
     // interrupt would only acquire the lock after the query's completion.
     interrupt_lock: Arc<Mutex<*mut ffi::sqlite3>>,
+    #[cfg(feature = "hooks")]
+    pub(super) shared_hook_active: Arc<AtomicBool>,
     owned: bool,
 }
 
@@ -33,6 +37,8 @@ impl InnerConnection {
         Self {
             db,
             interrupt_lock: Arc::new(Mutex::new(if owned { db } else { ptr::null_mut() })),
+            #[cfg(feature = "hooks")]
+            shared_hook_active: Arc::new(AtomicBool::new(false)),
             owned,
         }
     }

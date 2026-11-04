@@ -2,7 +2,9 @@
 #![expect(non_camel_case_types)]
 
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::panic::catch_unwind;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ffi;
 
@@ -14,6 +16,27 @@ pub use preupdate_hook::*;
 
 #[cfg(feature = "preupdate_hook")]
 mod preupdate_hook;
+
+struct SharedHook<F> {
+    active: Arc<AtomicBool>,
+    callback: F,
+}
+
+struct HookGuard<'a>(&'a AtomicBool);
+impl<'a> HookGuard<'a> {
+    fn enter(active: &'a AtomicBool) -> Option<Self> {
+        if active.swap(true, Ordering::Relaxed) {
+            None
+        } else {
+            Some(Self(active))
+        }
+    }
+}
+impl Drop for HookGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
 
 /// Action Codes
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -437,21 +460,39 @@ impl Connection {
     /// is disabled.
     ///
     /// If the progress callback returns `true`, the operation is interrupted.
-    pub fn progress_handler<F>(&mut self, num_ops: c_int, handler: Option<F>) -> Result<()>
+    /// Changing either shared hook from inside one of these callbacks returns an error.
+    pub fn progress_handler<F>(&self, num_ops: c_int, handler: Option<F>) -> Result<()>
     where
         F: FnMut() -> bool + Send + 'static,
     {
-        self.db.borrow_mut().progress_handler(num_ops, handler)
+        self.db
+            .try_borrow_mut()
+            .map_err(|_| {
+                err!(
+                    ffi::SQLITE_MISUSE,
+                    "cannot change hooks during a connection operation"
+                )
+            })?
+            .progress_handler(num_ops, handler)
     }
 
     /// Register an authorizer callback that's invoked
     /// as a statement is being prepared.
+    /// Changing either shared hook from inside one of these callbacks returns an error.
     #[inline]
-    pub fn authorizer<F>(&mut self, hook: Option<F>) -> Result<()>
+    pub fn authorizer<F>(&self, hook: Option<F>) -> Result<()>
     where
         F: for<'r> FnMut(AuthContext<'r>) -> Authorization + Send + 'static,
     {
-        self.db.borrow_mut().authorizer(hook)
+        self.db
+            .try_borrow_mut()
+            .map_err(|_| {
+                err!(
+                    ffi::SQLITE_MISUSE,
+                    "cannot change hooks during a connection operation"
+                )
+            })?
+            .authorizer(hook)
     }
 }
 
@@ -655,20 +696,35 @@ impl InnerConnection {
     where
         F: FnMut() -> bool + Send + 'static,
     {
+        if self.shared_hook_active.load(Ordering::Relaxed) {
+            return Err(err!(
+                ffi::SQLITE_MISUSE,
+                "cannot change hooks while a callback is running"
+            ));
+        }
+
         unsafe extern "C" fn call_boxed_closure<F>(p_arg: *mut c_void) -> c_int
         where
             F: FnMut() -> bool,
         {
             unsafe {
-                let r = catch_unwind(|| {
-                    let boxed_handler: *mut F = p_arg.cast::<F>();
-                    (*boxed_handler)()
-                });
+                let hook = p_arg.cast::<SharedHook<F>>();
+                // Registration cannot free this hook while its guard is active.
+                let Some(_guard) = HookGuard::enter(&(*hook).active) else {
+                    return 1;
+                };
+
+                let r = catch_unwind(AssertUnwindSafe(|| ((*hook).callback)()));
                 c_int::from(r.unwrap_or_default())
             }
         }
 
         let x = handler.as_ref().map(|_| call_boxed_closure::<F> as _);
+        let handler = handler.map(|callback| SharedHook {
+            active: Arc::clone(&self.shared_hook_active),
+            callback,
+        });
+
         self.set_clientdata(c"sqlite3_progress_handler", handler, |db, bh| unsafe {
             if bh.is_null() {
                 ffi::sqlite3_progress_handler(db, num_ops, None, bh);
@@ -701,6 +757,13 @@ impl InnerConnection {
     where
         F: for<'r> FnMut(AuthContext<'r>) -> Authorization + Send + 'static,
     {
+        if self.shared_hook_active.load(Ordering::Relaxed) {
+            return Err(err!(
+                ffi::SQLITE_MISUSE,
+                "cannot change hooks while a callback is running"
+            ));
+        }
+
         unsafe extern "C" fn call_boxed_closure<'c, F>(
             p_arg: *mut c_void,
             action_code: c_int,
@@ -713,7 +776,13 @@ impl InnerConnection {
             F: FnMut(AuthContext<'c>) -> Authorization + Send + 'static,
         {
             unsafe {
-                catch_unwind(|| {
+                let hook = p_arg.cast::<SharedHook<F>>();
+                // The guard also prevents recursively borrowing this FnMut callback.
+                let Some(_guard) = HookGuard::enter(&(*hook).active) else {
+                    return ffi::SQLITE_DENY;
+                };
+
+                catch_unwind(AssertUnwindSafe(|| {
                     let action = AuthAction::from_raw(
                         action_code,
                         expect_optional_utf8(param1, "authorizer param 1"),
@@ -727,9 +796,8 @@ impl InnerConnection {
                             "accessor (inner-most trigger or view)",
                         ),
                     };
-                    let boxed_hook: *mut F = p_arg.cast::<F>();
-                    (*boxed_hook)(auth_ctx)
-                })
+                    ((*hook).callback)(auth_ctx)
+                }))
                 .map_or(ffi::SQLITE_ERROR, Authorization::into_raw)
             }
         }
@@ -737,6 +805,11 @@ impl InnerConnection {
         let x_auth = authorizer
             .as_ref()
             .map(|_| call_boxed_closure::<'c, F> as _);
+        let authorizer = authorizer.map(|callback| SharedHook {
+            active: Arc::clone(&self.shared_hook_active),
+            callback,
+        });
+
         self.set_clientdata(c"sqlite3_set_authorizer", authorizer, |db, bh| unsafe {
             if bh.is_null() {
                 ffi::sqlite3_set_authorizer(db, None, bh)
@@ -840,7 +913,7 @@ mod test {
 
     #[test]
     fn test_progress_handler() -> Result<()> {
-        let mut db = Connection::open_in_memory()?;
+        let db = Connection::open_in_memory()?;
 
         static CALLED: AtomicBool = AtomicBool::new(false);
         db.progress_handler(
@@ -857,7 +930,7 @@ mod test {
 
     #[test]
     fn test_progress_handler_interrupt() -> Result<()> {
-        let mut db = Connection::open_in_memory()?;
+        let db = Connection::open_in_memory()?;
 
         fn handler() -> bool {
             true
@@ -870,10 +943,63 @@ mod test {
     }
 
     #[test]
+    fn progress_replacement() -> Result<()> {
+        thread_local! {
+            static DB: Connection = Connection::open_in_memory().unwrap();
+        }
+        static REJECTED: AtomicBool = AtomicBool::new(false);
+
+        DB.with(|db| {
+            let mut statement = db.prepare("SELECT 1")?;
+            db.progress_handler(
+                1,
+                Some(|| {
+                    let rejected =
+                        DB.with(|db| db.progress_handler(0, None::<fn() -> bool>).is_err());
+                    REJECTED.store(rejected, Ordering::Relaxed);
+                    false
+                }),
+            )?;
+
+            let _: i64 = statement.query_row([], |row| row.get(0))?;
+            assert!(REJECTED.load(Ordering::Relaxed));
+
+            db.progress_handler(0, None::<fn() -> bool>)
+        })
+    }
+
+    #[test]
+    fn authorizer_replacement() -> Result<()> {
+        use super::{AuthContext, Authorization};
+
+        thread_local! {
+            static DB: Connection = Connection::open_in_memory().unwrap();
+        }
+        static REJECTED: AtomicBool = AtomicBool::new(false);
+
+        DB.with(|db| {
+            let mut statement = db.prepare("SELECT 1")?;
+            db.authorizer(Some(|_: AuthContext<'_>| {
+                let rejected = DB.with(|db| {
+                    db.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                        .is_err()
+                });
+                REJECTED.store(rejected, Ordering::Relaxed);
+                Authorization::Allow
+            }))?;
+
+            let _: i64 = statement.query_row([], |row| row.get(0))?;
+            assert!(REJECTED.load(Ordering::Relaxed));
+
+            db.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        })
+    }
+
+    #[test]
     fn test_authorizer() -> Result<()> {
         use super::{AuthAction, AuthContext, Authorization};
 
-        let mut db = Connection::open_in_memory()?;
+        let db = Connection::open_in_memory()?;
         db.execute_batch("CREATE TABLE foo (public TEXT, private TEXT)")?;
 
         let authorizer = move |ctx: AuthContext<'_>| match ctx.action {
