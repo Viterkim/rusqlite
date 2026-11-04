@@ -117,6 +117,10 @@ The new query, transaction, and fallible apply helpers accept any callback error
 
 For existing rusqlite decoders, `execute_cached`, `query_row_cached`, and `query_one_cached` provide cached versions of the usual connection helpers. Ordinary `execute` and `query_row` keep their existing preparation behavior.
 
+First row helpers check statement completion before reporting success. A write with `RETURNING` can produce a row and then fail to commit, and that failure is now returned. Manual row iteration can use `Rows::finish` to check completion without reading the remaining rows.
+
+`execute` rejects prepared statements with result columns before stepping them, including writes with `RETURNING` and queries that return no rows. Use the query methods for those statements.
+
 ### Column context
 
 `Row::get` conversion errors now use `Error::ColumnConversionFailure`. Its `ColumnError` records the column index, name, stored SQLite type, requested Rust type, and original conversion error. The original parser error remains reachable through the standard source chain.
@@ -125,6 +129,8 @@ Code matching the old conversion variants from `Row::get` should inspect `Column
 
 `types::from_sql_try` reads an existing SQL representation and applies `TryFrom`, simplifying validated newtypes. `FromSqlError::other` also accepts an existing boxed error without boxing it again.
 
+`Row::get_blob` and `get_text` borrow bytes or UTF-8 text without copying, while retaining the same column conversion context. Numeric parameter indices are checked before conversion to SQLite's integer type. SQLite error code accessors also cover `SqlInputError`.
+
 ### Session callbacks and owned rows
 
 Streaming operations retain their original I/O errors in `Error::SessionIoFailure`, including failures encountered after starting a streaming iterator. The SQLite error code is retained too.
@@ -132,6 +138,10 @@ Streaming operations retain their original I/O errors in `Error::SessionIoFailur
 `Connection::apply_bytes_try` accepts a conflict callback returning `Result<ConflictAction, E>`. A callback error aborts the apply and returns the original value alongside SQLite's outcome in `SessionApplyError<E>`. The callback error can be any type.
 
 `ChangesetItem::to_owned` copies row metadata, primary key flags, and old/new values into an `OwnedChangesetRow`. Absent update fields stay distinct from SQL NULL. A foreign key conflict has no row to copy and returns an error.
+
+`Session::changeset_bytes(max_bytes)` collects streamed output with a caller supplied byte limit and fallible buffer allocation. Its `ChangesetBytesError` distinguishes a size limit from allocation or SQLite failures. The limit applies to emitted bytes, so an upper bound from size tracking does not reject output that would fit. `Changeset::as_bytes` borrows an existing encoded changeset.
+
+Commit hook panics veto the commit, and progress handler panics interrupt the operation. WAL hook panics now return an error too. WAL callbacks run after commit, so their failure does not undo committed data.
 
 ### Scoped transactions and savepoints
 
@@ -142,3 +152,13 @@ Explicit transaction and savepoint `finish` calls retain a failed commit error e
 ### Encryption methods
 
 With the `codec` feature, `Connection::set_key` and `rekey` provide distinct methods for installing and changing an encryption key. The earlier `key` method with its boolean argument remains available.
+
+## File opening and connection settings
+
+`Connection::open_file` and `open_file_with_flags` treat their paths as literal filenames, including names beginning with `file:` or equal to `:memory:`. They resolve relative paths before opening so SQLite's global URI setting cannot reinterpret them. Use `open` for URI names or `open_in_memory` for an in-memory database.
+
+`set_foreign_keys`, `set_trusted_schema`, `set_journal_mode`, and `set_synchronous` verify that the requested setting is active. Journal and synchronization modes use `JournalMode` and `Synchronous`. An ignored request returns `Error::PragmaValueMismatch` with the requested and actual values. Journal and synchronization setters apply to the main database.
+
+## Backup cancellation
+
+`Backup::run_to_completion_with` accepts a borrowed `FnMut` callback returning any error type. The callback receives `StepResult` and progress, so it can cancel or stop retrying busy databases. `BackupError<E>` retains callback errors unchanged. The callback also runs after `Done`, when the backup has already completed. Nonpositive page counts return an error from both completion helpers.

@@ -1,3 +1,4 @@
+use crate::pragma::PragmaMismatch;
 use crate::types::FromSqlError;
 use crate::types::Type;
 use crate::{Result, errmsg_to_string, ffi};
@@ -72,6 +73,12 @@ pub enum Error {
 
     /// Error converting a file path to a string.
     InvalidPath(PathBuf),
+
+    /// Resolving a literal database filename failed.
+    PathResolutionFailure(PathBuf, std::io::Error),
+
+    /// SQLite left a different pragma value active after a verified setter.
+    PragmaValueMismatch(Box<PragmaMismatch>),
 
     /// Error returned when an [`execute`](crate::Connection::execute) call
     /// returns rows.
@@ -181,6 +188,7 @@ impl PartialEq for Error {
             (Self::NulError(e1), Self::NulError(e2)) => e1 == e2,
             (Self::InvalidParameterName(n1), Self::InvalidParameterName(n2)) => n1 == n2,
             (Self::InvalidPath(p1), Self::InvalidPath(p2)) => p1 == p2,
+            (Self::PragmaValueMismatch(a), Self::PragmaValueMismatch(b)) => a == b,
             (Self::ExecuteReturnedResults, Self::ExecuteReturnedResults) => true,
             (Self::QueryReturnedNoRows, Self::QueryReturnedNoRows) => true,
             (Self::QueryReturnedMoreThanOneRow, Self::QueryReturnedMoreThanOneRow) => true,
@@ -296,6 +304,20 @@ impl fmt::Display for Error {
             Self::NulError(ref err) => err.fmt(f),
             Self::InvalidParameterName(ref name) => write!(f, "Invalid parameter name: {name}"),
             Self::InvalidPath(ref p) => write!(f, "Invalid path: {}", p.to_string_lossy()),
+            Self::PathResolutionFailure(ref path, ref source) => {
+                write!(f, "Could not resolve database path {path:?}: {source}")
+            }
+            Self::PragmaValueMismatch(ref mismatch) => {
+                let PragmaMismatch {
+                    name,
+                    requested,
+                    actual,
+                } = &**mismatch;
+                write!(
+                    f,
+                    "Pragma {name} requested {requested:?}, SQLite left {actual:?} active"
+                )
+            }
             Self::ExecuteReturnedResults => {
                 write!(f, "Execute returned results - did you mean to call query?")
             }
@@ -354,6 +376,7 @@ impl error::Error for Error {
             Self::SqliteFailure(ref err, _) => Some(err),
             Self::Utf8Error(_, ref err) => Some(err),
             Self::NulError(ref err) => Some(err),
+            Self::PathResolutionFailure(_, ref source) => Some(source),
 
             Self::IntegralValueOutOfRange(..)
             | Self::SqliteSingleThreadedMode
@@ -365,6 +388,7 @@ impl error::Error for Error {
             | Self::InvalidColumnName(_)
             | Self::InvalidColumnType(..)
             | Self::InvalidPath(_)
+            | Self::PragmaValueMismatch(_)
             | Self::InvalidParameterCount(..)
             | Self::StatementChangedRows(_)
             | Self::InvalidQuery
@@ -398,13 +422,12 @@ impl error::Error for Error {
 }
 
 impl Error {
-    /// Returns the underlying SQLite error for a SQLite failure or a session
-    /// streaming I/O failure.
+    /// Returns the underlying SQLite error, when available.
     #[inline]
     #[must_use]
     pub fn sqlite_error(&self) -> Option<&ffi::Error> {
         match self {
-            Self::SqliteFailure(error, _) => Some(error),
+            Self::SqliteFailure(error, _) | Self::SqlInputError { error, .. } => Some(error),
             #[cfg(feature = "session")]
             Self::SessionIoFailure(error, _) => Some(error),
             _ => None,

@@ -98,6 +98,7 @@ pub use crate::ffi::ErrorCode;
 #[cfg(feature = "load_extension")]
 pub use crate::load_extension_guard::LoadExtensionGuard;
 pub use crate::params::{Params, ParamsFromIter, params_from_iter};
+pub use crate::pragma::{JournalMode, PragmaMismatch, Synchronous};
 pub use crate::query::QueryError;
 pub use crate::row::{AndThenRows, ColumnError, Map, MappedRows, Row, RowIndex, Rows};
 pub use crate::statement::{Statement, StatementStatus};
@@ -454,6 +455,35 @@ impl Connection {
         Self::open_with_flags(path, flags)
     }
 
+    /// Open a literal database filename, creating the file when needed.
+    ///
+    /// Relative paths are resolved against the current directory. Names such
+    /// as `file:example?mode=memory` and `:memory:` are treated as filenames.
+    pub fn open_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_file_with_flags(path, OpenFlags::default())
+    }
+
+    /// Open a literal database filename using the supplied flags.
+    ///
+    /// The path is made absolute before opening, so SQLite cannot interpret
+    /// it as a URI even when URI processing is enabled globally. The
+    /// `SQLITE_OPEN_MEMORY` flag is rejected.
+    pub fn open_file_with_flags<P: AsRef<Path>>(path: P, mut flags: OpenFlags) -> Result<Self> {
+        if flags.contains(OpenFlags::SQLITE_OPEN_MEMORY) {
+            return Err(err!(
+                ffi::SQLITE_MISUSE,
+                "open_file requires a file database"
+            ));
+        }
+
+        let path = path.as_ref();
+        let absolute = std::path::absolute(path)
+            .map_err(|source| Error::PathResolutionFailure(path.to_owned(), source))?;
+        flags.remove(OpenFlags::SQLITE_OPEN_URI);
+
+        Self::open_with_flags(absolute, flags)
+    }
+
     /// Open a new connection to an in-memory SQLite database.
     ///
     /// # Failure
@@ -770,7 +800,9 @@ impl Connection {
         let mut stmt = self.prepare(sql)?;
         let mut rows = stmt.query(params)?;
 
-        rows.get_expected_row().map_err(E::from).and_then(f)
+        let value = rows.get_expected_row().map_err(E::from).and_then(f)?;
+        rows.finish()?;
+        Ok(value)
     }
 
     /// Prepare a SQL statement for execution.
@@ -1671,7 +1703,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "extra_check")]
     fn test_execute_select_with_no_row() {
         let db = checked_memory_handle();
         let err = db.execute("SELECT 1 WHERE 1 < ?1", [1i32]).unwrap_err();

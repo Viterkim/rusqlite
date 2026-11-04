@@ -110,7 +110,8 @@ impl Connection {
         let mut stmt = self.prepare(sql).map_err(sql_error)?;
         let mut rows = stmt.query(params).map_err(sql_error)?;
 
-        rows.next()
+        let value = rows
+            .next()
             .map_err(sql_error)?
             .map(|row| {
                 decode(row).map_err(|source| QueryError::Decode {
@@ -119,7 +120,10 @@ impl Connection {
                     source,
                 })
             })
-            .transpose()
+            .transpose()?;
+        rows.finish().map_err(sql_error)?;
+
+        Ok(value)
     }
 
     /// Execute a statement using the prepared statement cache.
@@ -155,6 +159,33 @@ mod tests {
 
     #[cfg(all(target_family = "wasm", target_os = "unknown"))]
     use wasm_bindgen_test::wasm_bindgen_test as test;
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn finish_write() -> crate::Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.db");
+        let writer = Connection::open(&path)?;
+        let reader = Connection::open(&path)?;
+        writer.busy_timeout(std::time::Duration::ZERO)?;
+        writer.execute_batch("CREATE TABLE t(a); INSERT INTO t VALUES (1)")?;
+        reader.execute_batch("BEGIN; SELECT * FROM t")?;
+
+        let error = writer
+            .query_first("INSERT INTO t VALUES (2) RETURNING a", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap_err();
+        let QueryError::Sql { source, .. } = error else {
+            panic!("expected finishing to fail");
+        };
+
+        assert_eq!(
+            source.sqlite_error_code(),
+            Some(crate::ErrorCode::DatabaseBusy)
+        );
+        Ok(())
+    }
 
     #[test]
     fn first_stops() -> crate::Result<()> {

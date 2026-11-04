@@ -349,6 +349,8 @@ impl Statement<'_> {
     pub fn exists<P: Params>(&mut self, params: P) -> Result<bool> {
         let mut rows = self.query(params)?;
         let exists = rows.next()?.is_some();
+        rows.finish()?;
+
         Ok(exists)
     }
 
@@ -373,8 +375,10 @@ impl Statement<'_> {
         F: FnOnce(&Row<'_>) -> Result<T>,
     {
         let mut rows = self.query(params)?;
+        let value = rows.get_expected_row().and_then(f)?;
+        rows.finish()?;
 
-        rows.get_expected_row().and_then(f)
+        Ok(value)
     }
 
     /// Convenience method to execute a query that is expected to return exactly
@@ -456,7 +460,7 @@ impl Statement<'_> {
     ///
     /// # Failure
     ///
-    /// Will return `None` if the column index is out of bounds or if the
+    /// Will return `None` if the parameter index is out of bounds or if the
     /// parameter is positional.
     ///
     /// # Panics
@@ -464,10 +468,12 @@ impl Statement<'_> {
     /// Panics when parameter name is not valid UTF-8.
     #[inline]
     pub fn parameter_name(&self, index: usize) -> Option<&'_ str> {
-        self.stmt.bind_parameter_name(index as i32).map(|name| {
-            name.to_str()
-                .expect("Invalid UTF-8 sequence in parameter name")
-        })
+        self.stmt
+            .bind_parameter_name(c_int::try_from(index).ok()?)
+            .map(|name| {
+                name.to_str()
+                    .expect("Invalid UTF-8 sequence in parameter name")
+            })
     }
 
     #[inline]
@@ -710,16 +716,11 @@ impl Statement<'_> {
     }
 
     #[inline]
-    #[allow(clippy::unnecessary_wraps)]
     fn check_update(&self) -> Result<()> {
-        cfg_select! {
-            feature = "extra_check" => {
-                if self.column_count() > 0 && self.stmt.readonly() {
-                    return Err(Error::ExecuteReturnedResults);
-                }
-            }
-            _ => {}
+        if self.column_count() > 0 {
+            return Err(Error::ExecuteReturnedResults);
         }
+
         Ok(())
     }
 
@@ -922,6 +923,17 @@ mod test {
 
     use crate::types::ToSql;
     use crate::{Connection, Error, Result, params_from_iter};
+
+    #[test]
+    fn execute_returning() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE t(a)")?;
+        db.execute("INSERT INTO t VALUES (1) RETURNING a", [])
+            .unwrap_err();
+
+        assert_eq!(db.one_column::<i64, _>("SELECT count(*) FROM t", [])?, 0);
+        Ok(())
+    }
 
     #[test]
     fn test_execute_named() -> Result<()> {

@@ -22,8 +22,15 @@ pub trait BindIndex: sealed::Sealed + Copy {
 
 impl BindIndex for usize {
     #[inline]
-    fn idx(&self, _: &Statement<'_>) -> Result<usize> {
-        // No validation
+    fn idx(&self, stmt: &Statement<'_>) -> Result<usize> {
+        if *self == 0 || *self > stmt.parameter_count() {
+            return Err(err!(
+                ffi::SQLITE_RANGE,
+                "Parameter index {self} is out of range for {} parameters",
+                stmt.parameter_count()
+            ));
+        }
+
         Ok(*self)
     }
 }

@@ -44,6 +44,15 @@ impl<'stmt> Rows<'stmt> {
         Ok((*self).get())
     }
 
+    /// Reset the statement and report errors encountered while finishing it.
+    ///
+    /// Remaining rows are not read. A write with `RETURNING` can fail while
+    /// finishing even after SQLite has returned a row.
+    pub fn finish(mut self) -> Result<()> {
+        self.row = None;
+        self.reset()
+    }
+
     /// Map over this `Rows`, converting it to a [`Map`], which
     /// implements `FallibleIterator`.
     /// ```rust,no_run
@@ -313,15 +322,43 @@ impl Row<'_> {
     pub fn get<I: RowIndex, T: FromSql>(&self, idx: I) -> Result<T> {
         let idx = idx.idx(self.stmt)?;
         let value = self.stmt.value_ref(idx);
-        FromSql::column_result(value).map_err(|source| {
-            Error::ColumnConversionFailure(Box::new(ColumnError {
-                index: idx,
-                name: self.stmt.column_name_unwrap(idx).into(),
-                sql_type: value.data_type(),
-                rust_type: type_name::<T>(),
-                source,
-            }))
-        })
+        FromSql::column_result(value)
+            .map_err(|source| self.conversion_error::<T>(idx, value.data_type(), source))
+    }
+
+    /// Borrow a BLOB column without copying its bytes.
+    ///
+    /// Other SQLite types return [`Error::ColumnConversionFailure`], with the
+    /// same column context as [`Row::get`].
+    pub fn get_blob<I: RowIndex>(&self, idx: I) -> Result<&[u8]> {
+        let idx = idx.idx(self.stmt)?;
+        let value = self.stmt.value_ref(idx);
+        value
+            .as_blob()
+            .map_err(|source| self.conversion_error::<&[u8]>(idx, value.data_type(), source))
+    }
+
+    /// Borrow a TEXT column as UTF-8 without copying it.
+    ///
+    /// Other SQLite types and invalid UTF-8 return
+    /// [`Error::ColumnConversionFailure`], with the same column context as
+    /// [`Row::get`].
+    pub fn get_text<I: RowIndex>(&self, idx: I) -> Result<&str> {
+        let idx = idx.idx(self.stmt)?;
+        let value = self.stmt.value_ref(idx);
+        value
+            .as_str()
+            .map_err(|source| self.conversion_error::<&str>(idx, value.data_type(), source))
+    }
+
+    fn conversion_error<T>(&self, idx: usize, sql_type: Type, source: FromSqlError) -> Error {
+        Error::ColumnConversionFailure(Box::new(ColumnError {
+            index: idx,
+            name: self.stmt.column_name_unwrap(idx).into(),
+            sql_type,
+            rust_type: type_name::<T>(),
+            source,
+        }))
     }
 
     /// Get the value of a particular column of the result row as a `ValueRef`,
@@ -513,6 +550,37 @@ mod tests {
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
     use crate::{Connection, Result};
+
+    #[test]
+    fn borrowed_errors() -> Result<()> {
+        use std::error::Error as _;
+
+        use crate::Error;
+        use crate::types::FromSqlError;
+
+        let db = Connection::open_in_memory()?;
+        let mut stmt = db.prepare("SELECT CAST(x'ff' AS TEXT) AS text, x'01' AS blob")?;
+        let mut rows = stmt.query([])?;
+        let row = rows.next()?.unwrap();
+
+        for error in [
+            row.get_blob("text").unwrap_err(),
+            row.get_text("blob").unwrap_err(),
+        ] {
+            let Error::ColumnConversionFailure(error) = error else {
+                panic!("missing column context");
+            };
+
+            assert_eq!(error.source, FromSqlError::InvalidType);
+        }
+
+        let Error::ColumnConversionFailure(error) = row.get_text("text").unwrap_err() else {
+            panic!("missing column context");
+        };
+
+        assert!(error.source.source().unwrap().is::<std::str::Utf8Error>());
+        Ok(())
+    }
 
     #[test]
     fn column_context() -> Result<()> {

@@ -366,7 +366,7 @@ impl Connection {
     /// Register a callback function to be invoked whenever
     /// a transaction is committed.
     ///
-    /// The callback returns `true` to rollback.
+    /// The callback returns `true` to rollback. A panic also rolls back.
     #[inline]
     pub fn commit_hook<F>(&mut self, hook: Option<F>) -> Result<()>
     where
@@ -409,6 +409,9 @@ impl Connection {
     /// Calling `wal_hook` replaces any previously registered write-ahead log callback.
     /// Note that the `sqlite3_wal_autocheckpoint()` interface and the `wal_autocheckpoint` pragma
     /// both invoke `sqlite3_wal_hook()` and will overwrite any prior `sqlite3_wal_hook()` settings.
+    ///
+    /// This callback runs after commit. A callback error or panic is returned
+    /// to the caller after the data has already been committed.
     pub fn wal_hook<F>(&mut self, hook: Option<F>) -> Result<()>
     where
         F: FnMut(&mut Wal, c_int) -> Result<()> + Send + 'static,
@@ -436,7 +439,7 @@ impl Connection {
                             .map_or(ffi::SQLITE_ERROR, |x| x.extended_code),
                     }
                 })
-                .unwrap_or_default()
+                .unwrap_or(ffi::SQLITE_ERROR)
             }
         }
         let x = hook.as_ref().map(|_| wal_hook_callback::<F> as _);
@@ -459,7 +462,7 @@ impl Connection {
     /// `handler`. If `num_ops` is less than one then the progress handler
     /// is disabled.
     ///
-    /// If the progress callback returns `true`, the operation is interrupted.
+    /// If the progress callback returns `true` or panics, the operation is interrupted.
     /// Changing either shared hook from inside one of these callbacks returns an error.
     pub fn progress_handler<F>(&self, num_ops: c_int, handler: Option<F>) -> Result<()>
     where
@@ -557,7 +560,7 @@ impl InnerConnection {
                     let boxed_hook: *mut F = p_arg.cast::<F>();
                     (*boxed_hook)()
                 });
-                c_int::from(r.unwrap_or_default())
+                c_int::from(r.unwrap_or(true))
             }
         }
         let x = hook.as_ref().map(|_| call_boxed_closure::<F> as _);
@@ -715,7 +718,7 @@ impl InnerConnection {
                 };
 
                 let r = catch_unwind(AssertUnwindSafe(|| ((*hook).callback)()));
-                c_int::from(r.unwrap_or_default())
+                c_int::from(r.unwrap_or(true))
             }
         }
 

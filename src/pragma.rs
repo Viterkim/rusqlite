@@ -3,8 +3,63 @@
 use std::ops::Deref;
 
 use crate::ffi;
-use crate::types::{FromSql, ToSql, ToSqlOutput, ValueRef};
-use crate::{Connection, Result, Row};
+use crate::types::{FromSql, ToSql, ToSqlOutput, Value, ValueRef};
+use crate::{Connection, Error, Result, Row};
+
+/// SQLite journal modes for [`Connection::set_journal_mode`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JournalMode {
+    /// Delete the rollback journal after committing.
+    Delete,
+    /// Truncate the rollback journal after committing.
+    Truncate,
+    /// Keep the rollback journal and invalidate its header after committing.
+    Persist,
+    /// Keep the rollback journal in memory.
+    Memory,
+    /// Use a write-ahead log.
+    Wal,
+    /// Disable rollback journaling.
+    Off,
+}
+impl JournalMode {
+    /// The value used by SQLite's journal_mode pragma.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delete => "delete",
+            Self::Truncate => "truncate",
+            Self::Persist => "persist",
+            Self::Memory => "memory",
+            Self::Wal => "wal",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// SQLite synchronization modes for [`Connection::set_synchronous`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i64)]
+pub enum Synchronous {
+    /// Skip synchronization calls.
+    Off = 0,
+    /// Synchronize at the points required by normal mode.
+    Normal = 1,
+    /// Synchronize additional writes for full durability.
+    Full = 2,
+    /// Include the extra directory synchronization used by DELETE journals.
+    Extra = 3,
+}
+
+/// A pragma value that SQLite left different from the requested value.
+#[derive(Debug, PartialEq)]
+pub struct PragmaMismatch {
+    /// Name of the pragma.
+    pub name: String,
+    /// The value requested by the caller.
+    pub requested: Value,
+    /// The value SQLite left active.
+    pub actual: Value,
+}
 
 pub struct Sql {
     buf: String,
@@ -170,6 +225,64 @@ impl Deref for Sql {
 }
 
 impl Connection {
+    /// Set foreign key enforcement and verify that SQLite accepted the change.
+    ///
+    /// SQLite ignores changes to foreign_keys inside a transaction. This method
+    /// returns [`Error::PragmaValueMismatch`] when the requested state is not active.
+    pub fn set_foreign_keys(&self, enabled: bool) -> Result<()> {
+        self.pragma_update(None, "foreign_keys", enabled)?;
+        let actual: bool = self.pragma_query_one(None, "foreign_keys")?;
+
+        verify_pragma(
+            "foreign_keys",
+            Value::Integer(i64::from(enabled)),
+            Value::Integer(i64::from(actual)),
+        )
+    }
+
+    /// Set trusted_schema and verify that the requested state is active.
+    pub fn set_trusted_schema(&self, enabled: bool) -> Result<()> {
+        self.pragma_update(None, "trusted_schema", enabled)?;
+        let actual: bool = self.pragma_query_one(None, "trusted_schema")?;
+
+        verify_pragma(
+            "trusted_schema",
+            Value::Integer(i64::from(enabled)),
+            Value::Integer(i64::from(actual)),
+        )
+    }
+
+    /// Set the main database's journal mode and verify the resulting mode.
+    ///
+    /// Returns [`Error::PragmaValueMismatch`] when SQLite keeps another mode,
+    /// such as when WAL is requested for an in-memory database.
+    pub fn set_journal_mode(&self, mode: JournalMode) -> Result<()> {
+        let requested = mode.as_str();
+        let actual: String =
+            self.pragma_update_and_check(Some("main"), "journal_mode", requested, |row| {
+                row.get(0)
+            })?;
+
+        verify_pragma(
+            "journal_mode",
+            Value::Text(requested.into()),
+            Value::Text(actual.to_ascii_lowercase()),
+        )
+    }
+
+    /// Set the main database's synchronization mode and verify the result.
+    pub fn set_synchronous(&self, mode: Synchronous) -> Result<()> {
+        let requested = mode as i64;
+        self.pragma_update(Some("main"), "synchronous", requested)?;
+        let actual: i64 = self.pragma_query_one(Some("main"), "synchronous")?;
+
+        verify_pragma(
+            "synchronous",
+            Value::Integer(requested),
+            Value::Integer(actual),
+        )
+    }
+
     /// Query the current value of `pragma_name`.
     pub fn pragma_query_one<T: FromSql>(
         &self,
@@ -308,6 +421,18 @@ impl Connection {
         sql.push_value(&pragma_value)?;
         self.query_row(&sql, [], f)
     }
+}
+
+fn verify_pragma(name: &str, requested: Value, actual: Value) -> Result<()> {
+    if requested == actual {
+        return Ok(());
+    }
+
+    Err(Error::PragmaValueMismatch(Box::new(PragmaMismatch {
+        name: name.into(),
+        requested,
+        actual,
+    })))
 }
 
 fn is_identifier(s: &str) -> bool {

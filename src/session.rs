@@ -1,6 +1,7 @@
 //! [Session Extension](https://sqlite.org/sessionintro.html)
 #![expect(non_camel_case_types)]
 
+use std::collections::TryReserveError;
 use std::error::Error as StdError;
 use std::ffi::{CStr, c_char, c_int, c_uchar, c_void};
 use std::fmt;
@@ -28,6 +29,45 @@ pub struct Session<'conn> {
     phantom: PhantomData<&'conn Connection>,
     s: *mut ffi::sqlite3_session,
     filter: Filter,
+}
+
+/// Failure while collecting a changeset into a bounded byte buffer.
+#[derive(Debug)]
+pub enum ChangesetBytesError {
+    /// SQLite could not generate the changeset.
+    Sqlite(Error),
+    /// The emitted changeset exceeded the requested byte limit.
+    TooLarge {
+        /// Maximum number of output bytes.
+        limit: usize,
+        /// Output size including the chunk that exceeded the limit.
+        attempted: usize,
+    },
+    /// Reserving space for the output failed.
+    Allocation(TryReserveError),
+}
+impl fmt::Display for ChangesetBytesError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sqlite(error) => error.fmt(f),
+            Self::TooLarge { limit, attempted } => {
+                write!(
+                    f,
+                    "changeset output of {attempted} bytes exceeds limit of {limit}"
+                )
+            }
+            Self::Allocation(error) => write!(f, "could not allocate changeset output: {error}"),
+        }
+    }
+}
+impl StdError for ChangesetBytesError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Sqlite(error) => Some(error),
+            Self::TooLarge { .. } => None,
+            Self::Allocation(error) => Some(error),
+        }
+    }
 }
 
 impl Session<'_> {
@@ -132,6 +172,26 @@ impl Session<'_> {
         let mut cs: *mut c_void = ptr::null_mut();
         check(unsafe { ffi::sqlite3session_changeset(self.s, &mut n, &mut cs) })?;
         Ok(Changeset { cs, n })
+    }
+
+    /// Collect a changeset, stopping when its emitted bytes exceed `max_bytes`.
+    ///
+    /// The limit applies to actual output, regardless of size tracking estimates.
+    /// Buffer allocation failures are returned without aborting the process.
+    pub fn changeset_bytes(&mut self, max_bytes: usize) -> Result<Vec<u8>, ChangesetBytesError> {
+        let mut output = ChangesetBytesWriter {
+            bytes: Vec::new(),
+            limit: max_bytes,
+            error: None,
+        };
+        let result = self.changeset_strm(&mut output);
+
+        if let Some(error) = output.error {
+            return Err(error);
+        }
+
+        result.map_err(ChangesetBytesError::Sqlite)?;
+        Ok(output.bytes)
     }
 
     /// Write the set of changes represented by this session to `output`.
@@ -282,6 +342,12 @@ pub struct Changeset {
 }
 
 impl Changeset {
+    /// Borrow the encoded changeset or patchset bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        // SQLite owns an n-byte buffer until this Changeset is dropped.
+        unsafe { from_raw_parts(self.cs.cast(), self.n) }
+    }
+
     /// Invert a changeset
     #[inline]
     pub fn invert(&self) -> Result<Changeset> {
@@ -1408,6 +1474,35 @@ where
         } else {
             ffi::SQLITE_CHANGESET_ABORT
         }
+    }
+}
+
+struct ChangesetBytesWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    error: Option<ChangesetBytesError>,
+}
+impl Write for ChangesetBytesWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            self.error = Some(ChangesetBytesError::TooLarge {
+                limit: self.limit,
+                attempted: self.bytes.len().saturating_add(bytes.len()),
+            });
+            return Err(io::ErrorKind::FileTooLarge.into());
+        }
+
+        if let Err(error) = self.bytes.try_reserve(bytes.len()) {
+            self.error = Some(ChangesetBytesError::Allocation(error));
+            return Err(io::ErrorKind::OutOfMemory.into());
+        }
+
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 

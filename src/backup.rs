@@ -37,14 +37,17 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::ptr;
 
+use std::convert::Infallible;
+use std::error;
 use std::ffi::c_int;
+use std::fmt;
 use std::thread;
 use std::time::Duration;
 
 use crate::ffi;
 
 use crate::error::error_from_handle;
-use crate::{Connection, MAIN_DB, Name, Result};
+use crate::{Connection, Error, MAIN_DB, Name, Result};
 
 impl Connection {
     /// Back up the `name` database to the given
@@ -173,6 +176,31 @@ pub struct Progress {
     pub pagecount: c_int,
 }
 
+/// A backup failure from SQLite or the progress callback.
+#[derive(Debug)]
+pub enum BackupError<E> {
+    /// SQLite could not perform the backup step.
+    Sqlite(Box<Error>),
+    /// The progress callback stopped the backup loop.
+    Callback(E),
+}
+impl<E: fmt::Display> fmt::Display for BackupError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sqlite(error) => write!(f, "Backup failed: {error}"),
+            Self::Callback(error) => write!(f, "Backup progress callback failed: {error}"),
+        }
+    }
+}
+impl<E: error::Error + 'static> error::Error for BackupError<E> {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Sqlite(error) => Some(&**error),
+            Self::Callback(error) => Some(error),
+        }
+    }
+}
+
 /// A handle to an online backup.
 pub struct Backup<'a, 'b> {
     phantom_from: PhantomData<&'a Connection>,
@@ -297,16 +325,50 @@ impl Backup<'_, '_> {
         pause_between_pages: Duration,
         progress: Option<fn(Progress)>,
     ) -> Result<()> {
+        self.run_to_completion_with(pages_per_step, pause_between_pages, |_, current| {
+            if let Some(progress) = progress {
+                progress(current);
+            }
+
+            Ok::<(), Infallible>(())
+        })
+        .map_err(|error| match error {
+            BackupError::Sqlite(error) => *error,
+            BackupError::Callback(never) => match never {},
+        })
+    }
+
+    /// Run a backup with a borrowed, mutable progress callback.
+    ///
+    /// The callback receives the step result and progress, including `Busy`
+    /// and `Locked`, and can return its own error to stop further steps.
+    /// It also runs after `Done`, when the backup has already completed.
+    /// Nonpositive page counts return an SQLite misuse error.
+    pub fn run_to_completion_with<E, F>(
+        &self,
+        pages_per_step: c_int,
+        pause_between_pages: Duration,
+        mut progress: F,
+    ) -> Result<(), BackupError<E>>
+    where
+        F: FnMut(StepResult, Progress) -> Result<(), E>,
+    {
         use self::StepResult::{Busy, Done, Locked, More};
 
-        assert!(pages_per_step > 0, "pages_per_step must be positive");
+        if pages_per_step <= 0 {
+            return Err(BackupError::Sqlite(Box::new(err!(
+                ffi::SQLITE_MISUSE,
+                "pages_per_step must be positive"
+            ))));
+        }
 
         loop {
-            let r = self.step(pages_per_step)?;
-            if let Some(progress) = progress {
-                progress(self.progress());
-            }
-            match r {
+            let result = self
+                .step(pages_per_step)
+                .map_err(|error| BackupError::Sqlite(Box::new(error)))?;
+            progress(result, self.progress()).map_err(BackupError::Callback)?;
+
+            match result {
                 More | Busy | Locked => thread::sleep(pause_between_pages),
                 Done => return Ok(()),
             }
