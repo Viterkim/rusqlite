@@ -91,9 +91,11 @@ These methods discard rebase output. SQLite marks the v2 API as experimental.
 
 ## Other fixes
 
-### Cached statements
+### Bundled SQLite
 
-The bundled native SQLite source includes the upstream [535a77cf5a fix](https://github.com/sqlite/sqlite/commit/78793bee814300ff98a48970edfed9189a64f5c6) for repeated statement compilation after clearing bindings ([rusqlite #1931](https://github.com/rusqlite/rusqlite/issues/1931)). SQLite's optimizations stay enabled and its reported version is still 3.54.1.
+Native bundled SQLite and SQLCipher include the upstream [535a77cf5a fix](https://github.com/sqlite/sqlite/commit/78793bee814300ff98a48970edfed9189a64f5c6) for repeated statement compilation after clearing bindings ([rusqlite #1931](https://github.com/rusqlite/rusqlite/issues/1931)). SQLite's optimizations stay enabled and its reported version is still 3.54.1.
+
+Native bundled SQLCipher is now 4.20.0, using SQLite 3.54.1. This includes the fix for uninitialized bytes after a short WAL frame read ([#1945](https://github.com/rusqlite/rusqlite/issues/1945)). Browser builds use the separate SQLite sources supplied by `sqlite-wasm-rs`.
 
 ### Explicit library directories
 

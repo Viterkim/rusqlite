@@ -1,4 +1,5 @@
 use std::env;
+use std::io;
 use std::path::Path;
 
 // Just to keep MSRV low
@@ -68,14 +69,14 @@ fn copy_bindings<T: AsRef<Path>>(dir: &str, bindgen_name: &str, out_path: T) {
     std::fs::copy(from, out_path).expect("Could not copy bindings to output directory");
 }
 
-fn main() {
+fn main() -> io::Result<()> {
     let out_dir = env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("bindgen.rs");
     if cfg!(feature = "in_gecko") {
         // When inside mozilla-central, we are included into the build with
         // sqlite3.o directly, so we don't want to provide any linker arguments.
         copy_bindings("sqlite3", "bindgen_bundled_version", out_path);
-        return;
+        return Ok(());
     }
 
     println!("cargo:rerun-if-env-changed=LIBSQLITE3_SYS_USE_PKG_CONFIG");
@@ -105,7 +106,7 @@ fn main() {
             feature = "bundled-windows",
             feature = "bundled-sqlcipher"
         ))]
-        build_bundled::main(&out_dir, &out_path);
+        build_bundled::main(&out_dir, &out_path)?;
         #[cfg(not(any(
             feature = "bundled",
             feature = "bundled-windows",
@@ -115,6 +116,8 @@ fn main() {
     } else {
         build_linked::main(&out_dir, &out_path);
     }
+
+    Ok(())
 }
 
 #[cfg(any(
@@ -125,11 +128,14 @@ fn main() {
 mod build_bundled {
     use std::env;
     use std::ffi::OsString;
+    #[cfg(feature = "bundled-sqlcipher")]
+    use std::fs;
+    use std::io;
     use std::path::{Path, PathBuf};
 
     use super::{is_compiler, win_target};
 
-    pub fn main(out_dir: &str, out_path: &Path) {
+    pub fn main(out_dir: &str, out_path: &Path) -> io::Result<()> {
         let lib_name = super::lib_name();
 
         // This is just a sanity check, the top level `main` should ensure this.
@@ -165,8 +171,12 @@ mod build_bundled {
         println!("cargo:include={}", include_dir.display());
         println!("cargo:rerun-if-changed={}", source.display());
         println!("cargo:rerun-if-changed=sqlite3/wasm32-wasi-vfs.c");
+        #[cfg(feature = "bundled-sqlcipher")]
+        let source = patched_sqlcipher(&source, out_dir)?;
+
         let mut cfg = cc::Build::new();
         cfg.file(&source)
+            .include(&include_dir)
             .flag("-DSQLITE_CORE")
             .flag("-DSQLITE_DEFAULT_FOREIGN_KEYS=1")
             .flag("-DSQLITE_ENABLE_API_ARMOR")
@@ -353,6 +363,60 @@ mod build_bundled {
         cfg.compile(lib_name);
 
         println!("cargo:lib_dir={out_dir}");
+        Ok(())
+    }
+
+    #[cfg(feature = "bundled-sqlcipher")]
+    fn patched_sqlcipher(source: &Path, out_dir: &str) -> io::Result<PathBuf> {
+        let mut source = fs::read_to_string(source)?;
+
+        // SQLite check-in 535a77cf5a, also applied to our bundled sqlite3.c.
+        // Avoid repeated recompilation after clearing cached statement bindings.
+        for (before, after) in [
+            (
+                "  Vdbe *p = (Vdbe*)pStmt;\n#if SQLITE_THREADSAFE",
+                concat!(
+                    "  Vdbe *p = (Vdbe*)pStmt;\n",
+                    "  u32 maskSmallInt = 0;  /* Bitmask of bindings with value 0 or 1 */\n",
+                    "#if SQLITE_THREADSAFE",
+                ),
+            ),
+            (
+                concat!(
+                    "  for(i=0; i<p->nVar; i++){\n",
+                    "    sqlite3VdbeMemRelease(&p->aVar[i]);\n",
+                    "    p->aVar[i].flags = MEM_Null;\n",
+                    "  }",
+                ),
+                concat!(
+                    "  for(i=0; i<p->nVar; i++){\n",
+                    "    Mem *pVar = &p->aVar[i];\n",
+                    "    if( (pVar->flags & MEM_Int)!=0 && pVar->u.i>=0 && pVar->u.i<=1 ){\n",
+                    "      maskSmallInt |= i>=31 ? 0x80000000 : ((u32)1)<<i;\n",
+                    "    }\n",
+                    "    sqlite3VdbeMemRelease(pVar);\n",
+                    "    pVar->flags = MEM_Null;\n",
+                    "  }",
+                ),
+            ),
+            (
+                "  if( p->expmask ){\n    p->expired = 1;\n  }",
+                "  if( (p->expmask&~p->smimask)!=0 || (p->smimask&maskSmallInt)!=0 ){\n    p->expired = 1;\n  }",
+            ),
+        ] {
+            if source.matches(before).count() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SQLCipher sqlite3_clear_bindings changed, review the cached statement patch",
+                ));
+            }
+
+            source = source.replacen(before, after, 1);
+        }
+
+        let path = Path::new(out_dir).join("sqlcipher.c");
+        fs::write(&path, source)?;
+        Ok(path)
     }
 
     fn env(name: &str) -> Option<OsString> {
