@@ -702,15 +702,14 @@ impl Statement<'_> {
     #[inline]
     fn execute_with_bound_parameters(&mut self) -> Result<usize> {
         self.check_update()?;
-        let r = self.stmt.step();
-        let rr = self.stmt.reset();
-        match r {
-            ffi::SQLITE_DONE => match rr {
-                ffi::SQLITE_OK => Ok(self.conn.changes() as usize),
-                _ => Err(self.conn.decode_result(rr).unwrap_err()),
-            },
-            ffi::SQLITE_ROW => Err(Error::ExecuteReturnedResults),
-            _ => Err(self.conn.decode_result(r).unwrap_err()),
+        let result = self.step();
+        let finish = self.reset();
+        match result? {
+            false => {
+                finish?;
+                Ok(self.conn.changes() as usize)
+            }
+            true => Err(Error::ExecuteReturnedResults),
         }
     }
 

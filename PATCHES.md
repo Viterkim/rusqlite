@@ -121,6 +121,12 @@ Pointer outputs keep owned data alive through cloning and binding, then release 
 
 ## Query, conversion, and callback errors
 
+### SQLite errors
+
+Open and I/O errors retain SQLite's last reported nonzero system code in `Error::SqliteSystemFailure`. `sqlite_system_errno` reads it after the connection has closed or the statement has reset. The code depends on the OS and VFS and can be stale. Use `sqlite_error` and the code accessors when matching SQLite failures, since either error variant can now carry them.
+
+Function and virtual table callbacks preserve extended SQLite error codes when forwarding messages. Statement execution captures its error before resetting, so cleanup cannot replace its original details.
+
 ### Query helpers
 
 `Connection::query_all` collects decoded rows. `query_first` decodes the first row and returns `None` for an empty result. Both accept fallible decoders with any error type, so your decoder errors need no conversion into rusqlite errors.
@@ -199,7 +205,7 @@ With the `codec` feature, `Connection::set_key` and `rekey` provide distinct met
 
 `Connection::table_columns(schema, table)` returns `TableColumn` records, including generated and hidden columns, primary key ordering, and default expressions as SQL text. Names are bound as parameters. This covers [#991](https://github.com/rusqlite/rusqlite/issues/991).
 
-`set_last_insert_rowid` exposes SQLite's connection metadata setter requested in [#1757](https://github.com/rusqlite/rusqlite/issues/1757). `system_errno` exposes the OS error number for an open connection's latest I/O failure, requested in [#458](https://github.com/rusqlite/rusqlite/issues/458).
+`set_last_insert_rowid` exposes SQLite's connection metadata setter requested in [#1757](https://github.com/rusqlite/rusqlite/issues/1757). `system_errno` reads SQLite's last reported system error from a live connection, and returned errors retain it through `sqlite_system_errno` ([#458](https://github.com/rusqlite/rusqlite/issues/458)).
 
 ## Deserialization safety
 

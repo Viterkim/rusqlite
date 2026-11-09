@@ -62,24 +62,14 @@ use std::sync::Arc;
 
 use crate::ffi::{self, sqlite3_context, sqlite3_value};
 
-use crate::context::set_result;
+use crate::context::{set_error, set_result};
 use crate::types::{FromSql, ToSql, ToSqlOutput, ValueRef, Values};
 use crate::util::{self, free_boxed_value};
-use crate::{Connection, Error, InnerConnection, Name, Result, str_to_cstring};
+use crate::{Connection, Error, InnerConnection, Name, Result};
 
 unsafe fn report_error(ctx: *mut sqlite3_context, err: &Error) {
     unsafe {
-        if let Error::SqliteFailure(ref err, ref s) = *err {
-            ffi::sqlite3_result_error_code(ctx, err.extended_code);
-            if let Some(Ok(cstr)) = s.as_ref().map(|s| str_to_cstring(s)) {
-                ffi::sqlite3_result_error(ctx, cstr.as_ptr(), -1);
-            }
-        } else {
-            ffi::sqlite3_result_error_code(ctx, ffi::SQLITE_CONSTRAINT_FUNCTION);
-            if let Ok(cstr) = str_to_cstring(&err.to_string()) {
-                ffi::sqlite3_result_error(ctx, cstr.as_ptr(), -1);
-            }
-        }
+        set_error(ctx, err, ffi::SQLITE_CONSTRAINT_FUNCTION);
     }
 }
 

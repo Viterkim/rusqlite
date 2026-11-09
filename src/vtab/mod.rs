@@ -18,14 +18,14 @@ use std::slice;
 
 use crate::ffi::{sqlite3_context, sqlite3_free, sqlite3_value};
 
-use crate::context::set_result;
+use crate::context::{set_error, set_result};
 use crate::error::{check, error_from_sqlite_code, to_sqlite_error};
 use crate::ffi;
 pub use crate::ffi::{sqlite3_vtab, sqlite3_vtab_cursor};
 use crate::types::{ToSql, Value, ValueRef};
 pub use crate::types::{ValueIter, Values};
 use crate::util::{alloc, free_boxed_value, from_raw_parts, from_raw_parts_mut};
-use crate::{Connection, Error, InnerConnection, Name, Result, str_to_cstring};
+use crate::{Connection, Error, InnerConnection, Name, Result};
 
 // let conn: Connection = ...;
 // let mod: Module = ...; // VTab builder
@@ -1424,15 +1424,14 @@ unsafe fn vtab_error<T>(vtab: *mut sqlite3_vtab, result: Result<T>) -> c_int {
     unsafe {
         match result {
             Ok(_) => ffi::SQLITE_OK,
-            Err(Error::SqliteFailure(err, s)) => {
-                if let Some(err_msg) = s {
-                    set_err_msg(vtab, &err_msg);
-                }
-                err.extended_code
-            }
             Err(err) => {
-                set_err_msg(vtab, &err.to_string());
-                ffi::SQLITE_ERROR
+                let code = err
+                    .sqlite_extended_error_code()
+                    .unwrap_or(ffi::SQLITE_ERROR);
+                if code != ffi::SQLITE_NOMEM {
+                    set_err_msg(vtab, &err.to_string());
+                }
+                code
             }
         }
     }
@@ -1457,30 +1456,7 @@ unsafe fn result_error<T>(ctx: *mut sqlite3_context, result: Result<T>) -> c_int
     unsafe {
         match result {
             Ok(_) => ffi::SQLITE_OK,
-            Err(Error::SqliteFailure(err, s)) => {
-                match err.extended_code {
-                    ffi::SQLITE_TOOBIG => {
-                        ffi::sqlite3_result_error_toobig(ctx);
-                    }
-                    ffi::SQLITE_NOMEM => {
-                        ffi::sqlite3_result_error_nomem(ctx);
-                    }
-                    code => {
-                        ffi::sqlite3_result_error_code(ctx, code);
-                        if let Some(Ok(cstr)) = s.map(|s| str_to_cstring(&s)) {
-                            ffi::sqlite3_result_error(ctx, cstr.as_ptr(), -1);
-                        }
-                    }
-                }
-                err.extended_code
-            }
-            Err(err) => {
-                ffi::sqlite3_result_error_code(ctx, ffi::SQLITE_ERROR);
-                if let Ok(cstr) = str_to_cstring(&err.to_string()) {
-                    ffi::sqlite3_result_error(ctx, cstr.as_ptr(), -1);
-                }
-                ffi::SQLITE_ERROR
-            }
+            Err(err) => set_error(ctx, &err, ffi::SQLITE_ERROR),
         }
     }
 }

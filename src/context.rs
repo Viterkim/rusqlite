@@ -1,11 +1,32 @@
 //! Code related to `sqlite3_context` common to `functions` and `vtab` modules.
 
-use std::ffi::c_void;
+use std::ffi::{c_int, c_void};
 
 use crate::ffi::{self, sqlite3_context, sqlite3_value};
-use crate::{Result, str_for_sqlite};
+use crate::{Error, Result, str_for_sqlite, str_to_cstring};
 
 use crate::types::{ToSqlOutput, Value, ValueRef};
+
+/// Set a callback error and return its SQLite code.
+///
+/// # Safety
+/// `ctx` must be the current SQLite callback's context, used on its thread.
+pub unsafe fn set_error(ctx: *mut sqlite3_context, error: &Error, default_code: c_int) -> c_int {
+    let code = error.sqlite_extended_error_code().unwrap_or(default_code);
+    unsafe {
+        match code {
+            ffi::SQLITE_NOMEM => ffi::sqlite3_result_error_nomem(ctx),
+            _ => {
+                if let Ok(message) = str_to_cstring(&error.to_string()) {
+                    ffi::sqlite3_result_error(ctx, message.as_ptr(), -1);
+                }
+                // Setting the message resets the code to SQLITE_ERROR.
+                ffi::sqlite3_result_error_code(ctx, code);
+            }
+        }
+    }
+    code
+}
 
 // This function is inline despite it's size because what's in the ToSqlOutput
 // is often known to the compiler, and thus const prop/DCE can substantially

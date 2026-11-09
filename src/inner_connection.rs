@@ -71,15 +71,16 @@ impl InnerConnection {
                     err!(r, "{}", c_path.to_string_lossy())
                 } else {
                     let mut e = error_from_handle(db, r);
-                    if let Error::SqliteFailure(
-                        ffi::Error {
-                            code: ffi::ErrorCode::CannotOpen,
+                    match &mut e {
+                        Error::SqliteFailure(error, Some(message))
+                        | Error::SqliteSystemFailure {
+                            error,
+                            message: Some(message),
                             ..
-                        },
-                        Some(msg),
-                    ) = e
-                    {
-                        e = err!(r, "{msg}: {}", c_path.to_string_lossy());
+                        } if error.code == ffi::ErrorCode::CannotOpen => {
+                            *message = format!("{message}: {}", c_path.to_string_lossy());
+                        }
+                        _ => {}
                     }
                     ffi::sqlite3_close(db);
                     e

@@ -702,9 +702,10 @@ impl Connection {
         unsafe { ffi::sqlite3_set_last_insert_rowid(self.db.borrow().db, rowid) }
     }
 
-    /// Return the OS error number associated with SQLite's most recent I/O failure.
+    /// Return SQLite's last reported system error number.
     ///
-    /// The number is platform dependent and may be zero when no OS error is available.
+    /// The number depends on the OS and VFS and may be stale or zero.
+    /// Returned open and I/O errors also retain it in [`Error::sqlite_system_errno`].
     pub fn system_errno(&self) -> c_int {
         unsafe { ffi::sqlite3_system_errno(self.db.borrow().db) }
     }
@@ -1594,16 +1595,10 @@ mod test {
     #[test]
     fn test_open_failure() {
         let filename = "no_such_file.db";
-        assert_matches!(
-            Connection::open_with_flags(filename, OpenFlags::SQLITE_OPEN_READ_ONLY),
-            Err(Error::SqliteFailure(
-                ffi::Error {
-                    code: ErrorCode::CannotOpen,
-                    extended_code: ffi::SQLITE_CANTOPEN,
-                },
-                Some(msg)
-            )) if msg.contains(filename)
-        );
+        let error =
+            Connection::open_with_flags(filename, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap_err();
+        assert_eq!(error.sqlite_error_code(), Some(ErrorCode::CannotOpen));
+        assert!(error.to_string().contains(filename));
     }
 
     #[cfg(unix)]

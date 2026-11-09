@@ -72,6 +72,18 @@ pub enum Error {
     /// An error from an underlying SQLite call.
     SqliteFailure(ffi::Error, Option<String>),
 
+    /// A SQLite I/O or open error with its last reported system error.
+    ///
+    /// The system code depends on the OS and VFS and may be stale.
+    SqliteSystemFailure {
+        /// SQLite's primary and extended error codes.
+        error: ffi::Error,
+        /// SQLite's error message, when available.
+        message: Option<String>,
+        /// The nonzero system error reported by SQLite's VFS.
+        system_errno: c_int,
+    },
+
     /// Error reported when attempting to open a connection when SQLite was
     /// configured to allow single-threaded use only.
     SqliteSingleThreadedMode,
@@ -237,6 +249,18 @@ impl PartialEq for Error {
             (Self::SessionCaptureFailure, Self::SessionCaptureFailure) => true,
             (Self::ColumnConversionFailure(a), Self::ColumnConversionFailure(b)) => a == b,
             (Self::SqliteFailure(e1, s1), Self::SqliteFailure(e2, s2)) => e1 == e2 && s1 == s2,
+            (
+                Self::SqliteSystemFailure {
+                    error: e1,
+                    message: m1,
+                    system_errno: n1,
+                },
+                Self::SqliteSystemFailure {
+                    error: e2,
+                    message: m2,
+                    system_errno: n2,
+                },
+            ) => e1 == e2 && m1 == m2 && n1 == n2,
             (Self::SqliteSingleThreadedMode, Self::SqliteSingleThreadedMode) => true,
             (Self::IntegralValueOutOfRange(i1, n1), Self::IntegralValueOutOfRange(i2, n2)) => {
                 i1 == i2 && n1 == n2
@@ -346,6 +370,17 @@ impl fmt::Display for Error {
             Self::SessionIoFailure(ref sqlite, ref source) => write!(f, "{sqlite}: {source}"),
             Self::SqliteFailure(ref err, None) => err.fmt(f),
             Self::SqliteFailure(_, Some(ref s)) => write!(f, "{s}"),
+            Self::SqliteSystemFailure {
+                ref error,
+                ref message,
+                system_errno,
+            } => {
+                match message {
+                    Some(message) => f.write_str(message)?,
+                    None => error.fmt(f)?,
+                }
+                write!(f, " (SQLite last system error: {system_errno})")
+            }
             Self::SqliteSingleThreadedMode => write!(
                 f,
                 "SQLite was compiled or configured for single-threaded use only"
@@ -456,6 +491,7 @@ impl error::Error for Error {
             #[cfg(feature = "session")]
             Self::SessionIoFailure(_, ref source) => Some(source),
             Self::SqliteFailure(ref err, _) => Some(err),
+            Self::SqliteSystemFailure { ref error, .. } => Some(error),
             Self::Utf8Error(_, ref err) => Some(err),
             Self::NulError(ref err) => Some(err),
             Self::PathResolutionFailure(_, ref source) => Some(source),
@@ -510,7 +546,9 @@ impl Error {
     #[must_use]
     pub fn sqlite_error(&self) -> Option<&ffi::Error> {
         match self {
-            Self::SqliteFailure(error, _) | Self::SqlInputError { error, .. } => Some(error),
+            Self::SqliteFailure(error, _)
+            | Self::SqliteSystemFailure { error, .. }
+            | Self::SqlInputError { error, .. } => Some(error),
             Self::StatementCompletionFailure(error) => error
                 .error
                 .sqlite_error()
@@ -546,6 +584,39 @@ impl Error {
     pub fn sqlite_extended_error_code(&self) -> Option<c_int> {
         self.sqlite_error().map(|error| error.extended_code)
     }
+
+    /// SQLite's last reported system error, captured before closing or resetting.
+    ///
+    /// Only open and I/O failures with a nonzero system code carry this detail.
+    /// Its meaning depends on the OS and VFS, and it may describe an earlier
+    /// failure. `SQLITE_IOERR_NOMEM` does not refresh it and is excluded.
+    pub fn sqlite_system_errno(&self) -> Option<c_int> {
+        match self {
+            Self::SqliteSystemFailure { system_errno, .. } => Some(*system_errno),
+            Self::StatementCompletionFailure(error) => error
+                .error
+                .sqlite_system_errno()
+                .or_else(|| error.finish_error.sqlite_system_errno()),
+            #[cfg(feature = "session")]
+            Self::SessionApplyFailure(error) => error
+                .apply_error
+                .as_deref()
+                .and_then(Error::sqlite_system_errno)
+                .or_else(|| {
+                    error
+                        .rollback_error
+                        .as_deref()
+                        .and_then(Error::sqlite_system_errno)
+                })
+                .or_else(|| {
+                    error
+                        .release_error
+                        .as_deref()
+                        .and_then(Error::sqlite_system_errno)
+                }),
+            _ => None,
+        }
+    }
 }
 
 // These are public but not re-exported by lib.rs, so only visible within crate.
@@ -572,7 +643,28 @@ macro_rules! err {
 
 #[cold]
 pub unsafe fn error_from_handle(db: *mut ffi::sqlite3, code: c_int) -> Error {
-    error_from_sqlite_code(code, unsafe { error_msg(db, code) })
+    let primary_code = code & 0xff;
+    let mut system_errno = 0;
+    if !db.is_null()
+        && matches!(primary_code, ffi::SQLITE_CANTOPEN | ffi::SQLITE_IOERR)
+        && code != ffi::SQLITE_IOERR_NOMEM
+    {
+        let handle_code = unsafe { ffi::sqlite3_extended_errcode(db) };
+        if handle_code & 0xff == primary_code && handle_code != ffi::SQLITE_IOERR_NOMEM {
+            system_errno = unsafe { ffi::sqlite3_system_errno(db) };
+        }
+    }
+
+    let message = unsafe { error_msg(db, code) };
+    if system_errno == 0 {
+        error_from_sqlite_code(code, message)
+    } else {
+        Error::SqliteSystemFailure {
+            error: ffi::Error::new(code),
+            message,
+            system_errno,
+        }
+    }
 }
 
 unsafe fn error_msg(db: *mut ffi::sqlite3, code: c_int) -> Option<String> {
@@ -606,19 +698,18 @@ pub unsafe fn error_with_offset(db: *mut ffi::sqlite3, code: c_int, sql: &str) -
             error_from_sqlite_code(code, None)
         } else {
             let error = ffi::Error::new(code);
-            let msg = error_msg(db, code);
             if ffi::ErrorCode::Unknown == error.code {
                 let offset = ffi::sqlite3_error_offset(db);
                 if offset >= 0 {
                     return Error::SqlInputError {
                         error,
-                        msg: msg.unwrap_or("error".to_owned()),
+                        msg: error_msg(db, code).unwrap_or_else(|| "error".to_owned()),
                         sql: sql.to_owned(),
                         offset,
                     };
                 }
             }
-            Error::SqliteFailure(error, msg)
+            error_from_handle(db, code)
         }
     }
 }
@@ -637,18 +728,11 @@ pub fn check(code: c_int) -> Result<()> {
 pub unsafe fn to_sqlite_error(e: &Error, err_msg: *mut *mut c_char) -> c_int {
     use crate::util::alloc;
 
-    match e {
-        Error::SqliteFailure(err, s) => {
-            if let Some(s) = s {
-                unsafe { *err_msg = alloc(s) };
-            }
-            err.extended_code
-        }
-        err => {
-            unsafe { *err_msg = alloc(&err.to_string()) };
-            ffi::SQLITE_ERROR
-        }
+    let code = e.sqlite_extended_error_code().unwrap_or(ffi::SQLITE_ERROR);
+    if code != ffi::SQLITE_NOMEM {
+        unsafe { *err_msg = alloc(&e.to_string()) };
     }
+    code
 }
 
 /// Set error code and message
