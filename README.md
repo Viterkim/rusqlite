@@ -131,6 +131,7 @@ features](https://doc.rust-lang.org/cargo/reference/manifest.html#the-features-s
 * `hooks` for [Commit, Rollback](http://sqlite.org/c3ref/commit_hook.html) and [Data Change](http://sqlite.org/c3ref/update_hook.html) notification callbacks.
 * `preupdate_hook` for [preupdate](https://sqlite.org/c3ref/preupdate_blobwrite.html) notification callbacks. (Implies `hooks`.)
 * `unlock_notify` for [Unlock](https://sqlite.org/unlock_notify.html) notification.
+* `cache` enables the prepared statement cache. It is enabled by default.
 * `vtab` for [virtual table](https://sqlite.org/vtab.html) support (allows you to write virtual table implementations in Rust). Currently, only read-only virtual tables are supported.
 * `series` exposes [`generate_series(...)`](https://www.sqlite.org/series.html) Table-Valued Function. (Implies `vtab`.)
 * [`csvtab`](https://sqlite.org/csv.html), CSV virtual table written in Rust. (Implies `vtab`.)

@@ -75,6 +75,8 @@ impl ToSql for DateTimeSql {
 //! a value was NULL (which gets translated to `None`).
 
 pub use self::from_sql::{FromSql, FromSqlError, FromSqlResult, from_sql_try};
+#[cfg(feature = "pointer")]
+pub use self::pointer::SqlPointer;
 #[cfg(any(feature = "functions", feature = "vtab"))]
 pub use self::raw_value::{RawValue, ValueIter, Values};
 pub use self::to_sql::{ToSql, ToSqlOutput};
@@ -88,6 +90,8 @@ mod chrono;
 mod from_sql;
 #[cfg(feature = "jiff")]
 mod jiff;
+#[cfg(feature = "pointer")]
+mod pointer;
 #[cfg(any(feature = "functions", feature = "vtab"))]
 mod raw_value;
 #[cfg(feature = "serde_json")]

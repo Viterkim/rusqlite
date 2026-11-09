@@ -4,7 +4,7 @@ use std::panic::catch_unwind;
 use std::time::Duration;
 
 use crate::ffi;
-use crate::{Connection, InnerConnection, Result};
+use crate::{Connection, Error, InnerConnection, Result};
 
 impl Connection {
     /// Set a busy handler that sleeps for a specified amount of time when a
@@ -22,12 +22,8 @@ impl Connection {
     /// Newly created connections currently have a default busy timeout of
     /// 5000ms, but this may be subject to change.
     pub fn busy_timeout(&self, timeout: Duration) -> Result<()> {
-        let ms: i32 = timeout
-            .as_secs()
-            .checked_mul(1000)
-            .and_then(|t| t.checked_add(timeout.subsec_millis().into()))
-            .and_then(|t| t.try_into().ok())
-            .expect("too big");
+        let ms = i32::try_from(timeout.as_millis())
+            .map_err(|_| Error::BusyTimeoutOutOfRange(timeout))?;
         self.db.borrow_mut().busy_timeout(ms)
     }
 

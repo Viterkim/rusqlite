@@ -367,7 +367,7 @@ impl Row<'_> {
     fn conversion_error<T>(&self, idx: usize, sql_type: Type, source: FromSqlError) -> Error {
         Error::ColumnConversionFailure(Box::new(ColumnError {
             index: idx,
-            name: self.stmt.column_name_unwrap(idx).into(),
+            name: self.stmt.column_name_unwrap(idx),
             sql_type,
             rust_type: type_name::<T>(),
             source,
@@ -418,9 +418,12 @@ impl Row<'_> {
         self.get_ref(idx).unwrap()
     }
 
-    /// Return raw pointer at `idx`
+    /// Return the pointer at `idx` as a reference.
+    ///
     /// # Safety
-    /// This function is unsafe because it uses raw pointer and cast
+    /// A pointer with this tag must point to a valid `T` for the returned
+    /// reference and obey Rust's aliasing rules. SQLite returns an unprotected
+    /// value here; access must not race with other SQLite operations on it.
     #[cfg(feature = "pointer")]
     pub unsafe fn get_pointer<I: RowIndex, T: 'static>(
         &self,
@@ -428,7 +431,6 @@ impl Row<'_> {
         ptr_type: &'static std::ffi::CStr,
     ) -> Result<Option<&T>> {
         let idx = idx.idx(self.stmt)?;
-        debug_assert_eq!(self.stmt.stmt.column_type(idx), super::ffi::SQLITE_NULL);
         unsafe {
             let sv = super::ffi::sqlite3_column_value(self.stmt.stmt.ptr(), idx as std::ffi::c_int);
             Ok(if sv.is_null() {
@@ -448,7 +450,7 @@ impl<'stmt> AsRef<Statement<'stmt>> for Row<'stmt> {
     }
 }
 
-/// Debug `Row` like an ordered `Map<Result<&str>, Result<(Type, ValueRef)>>`
+/// Debug `Row` like an ordered `Map<String, Result<(Type, ValueRef)>>`
 /// with column name as key except that for `Type::Blob` only its size is
 /// printed (not its content).
 impl std::fmt::Debug for Row<'_> {
@@ -790,8 +792,9 @@ mod tests {
         use crate::ffi::fts5_api;
         use crate::types::ToSqlOutput;
         const PTR_TYPE: &std::ffi::CStr = c"fts5_api_ptr";
-        let p_ret: *mut fts5_api = std::ptr::null_mut();
-        let ptr = ToSqlOutput::Pointer((&p_ret as *const *mut fts5_api as _, PTR_TYPE, None));
+        let mut p_ret: *mut fts5_api = std::ptr::null_mut();
+        // The output slot stays alive until SQLite has finished the query.
+        let ptr = unsafe { ToSqlOutput::from_raw(std::ptr::addr_of_mut!(p_ret).cast(), PTR_TYPE) };
         let db = Connection::open_in_memory()?;
         db.query_row("SELECT fts5(?)", [ptr], |_| Ok(()))?;
         assert!(!p_ret.is_null());

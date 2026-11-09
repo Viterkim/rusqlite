@@ -1,4 +1,4 @@
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, CString, c_char};
 use std::ptr;
 use std::str;
 
@@ -25,69 +25,69 @@ pub struct TableColumn {
     pub hidden: i64,
 }
 
-/// Information about a column of a SQLite query.
+/// Owned information about a column of a SQLite query.
 #[cfg(feature = "column_decltype")]
 #[derive(Debug)]
-pub struct Column<'stmt> {
-    name: &'stmt str,
-    decl_type: Option<&'stmt str>,
+pub struct Column {
+    name: String,
+    decl_type: Option<String>,
 }
 
 #[cfg(feature = "column_decltype")]
-impl Column<'_> {
+impl Column {
     /// Returns the name of the column.
     #[inline]
     #[must_use]
     pub fn name(&self) -> &str {
-        self.name
+        &self.name
     }
 
     /// Returns the type of the column (`None` for expression).
     #[inline]
     #[must_use]
     pub fn decl_type(&self) -> Option<&str> {
-        self.decl_type
+        self.decl_type.as_deref()
     }
 }
 
-/// Metadata about the origin of a column of a SQLite query
+/// Owned metadata about the origin of a column of a SQLite query.
 #[cfg(feature = "column_metadata")]
 #[derive(Debug)]
-pub struct ColumnMetadata<'stmt> {
-    name: &'stmt str,
-    database_name: Option<&'stmt str>,
-    table_name: Option<&'stmt str>,
-    origin_name: Option<&'stmt str>,
+pub struct ColumnMetadata {
+    name: String,
+    database_name: Option<String>,
+    table_name: Option<String>,
+    origin_name: Option<String>,
 }
 
 #[cfg(feature = "column_metadata")]
-impl ColumnMetadata<'_> {
+impl ColumnMetadata {
     #[inline]
     #[must_use]
     /// Returns the name of the column in the query results
     pub fn name(&self) -> &str {
-        self.name
+        &self.name
     }
 
     #[inline]
     #[must_use]
     /// Returns the database name from which the column originates
     pub fn database_name(&self) -> Option<&str> {
-        self.database_name
+        self.database_name.as_deref()
     }
 
     #[inline]
     #[must_use]
     /// Returns the table name from which the column originates
     pub fn table_name(&self) -> Option<&str> {
-        self.table_name
+        self.table_name.as_deref()
     }
 
     #[inline]
     #[must_use]
     /// Returns the column name from which the column originates
     pub fn origin_name(&self) -> Option<&str> {
-        self.origin_name
+        self.origin_name.as_deref()
     }
 }
 
@@ -97,7 +97,7 @@ impl Statement<'_> {
     /// If associated DB schema can be altered concurrently, you should make
     /// sure that current statement has already been stepped once before
     /// calling this method.
-    pub fn column_names(&self) -> impl DoubleEndedIterator<Item = &str> + ExactSizeIterator {
+    pub fn column_names(&self) -> impl DoubleEndedIterator<Item = String> + ExactSizeIterator {
         ColumnsIter::new(self, Statement::column_name_unwrap)
     }
 
@@ -112,27 +112,8 @@ impl Statement<'_> {
         self.stmt.column_count()
     }
 
-    /// Check that column name reference lifetime is limited:
-    /// <https://www.sqlite.org/c3ref/column_name.html>
-    /// > The returned string pointer is valid...
-    ///
-    /// `column_name` reference can become invalid if `stmt` is reprepared
-    /// (because of schema change) when `query_row` is called. So we assert
-    /// that a compilation error happens if this reference is kept alive:
-    /// ```compile_fail
-    /// use rusqlite::{Connection, Result};
-    /// fn main() -> Result<()> {
-    ///     let db = Connection::open_in_memory()?;
-    ///     let mut stmt = db.prepare("SELECT 1 as x")?;
-    ///     let column_name = stmt.column_name(0)?;
-    ///     let x = stmt.query_row([], |r| r.get::<_, i64>(0))?; // E0502
-    ///     assert_eq!(1, x);
-    ///     assert_eq!("x", column_name);
-    ///     Ok(())
-    /// }
-    /// ```
     #[inline]
-    pub(super) fn column_name_unwrap(&self, col: usize) -> &str {
+    pub(super) fn column_name_unwrap(&self, col: usize) -> String {
         // Just panic if the bounds are wrong for now, we never call this
         // without checking first.
         self.column_name(col).expect("Column out of bounds")
@@ -140,6 +121,8 @@ impl Statement<'_> {
 
     /// Returns the name assigned to a particular column in the result set
     /// returned by the prepared statement.
+    ///
+    /// The returned name stays valid when the statement is reprepared or dropped.
     ///
     /// If associated DB schema can be altered concurrently, you should make
     /// sure that current statement has already been stepped once before
@@ -154,7 +137,7 @@ impl Statement<'_> {
     ///
     /// Panics when column name is not valid UTF-8.
     #[inline]
-    pub fn column_name(&self, col: usize) -> Result<&str> {
+    pub fn column_name(&self, col: usize) -> Result<String> {
         self.stmt
             .column_name(col)
             // clippy::or_fun_call (nightly) vs clippy::unnecessary-lazy-evaluations (stable)
@@ -163,6 +146,7 @@ impl Statement<'_> {
                 slice
                     .to_str()
                     .expect("Invalid UTF-8 sequence in column name")
+                    .to_owned()
             })
     }
 
@@ -193,18 +177,19 @@ impl Statement<'_> {
         Err(Error::InvalidColumnName(String::from(name)))
     }
 
-    /// Returns a slice describing the columns of the result of the query.
+    /// Returns an iterator describing the columns of the result of the query.
     ///
     /// If associated DB schema can be altered concurrently, you should make
     /// sure that current statement has already been stepped once before
     /// calling this method.
     #[cfg(feature = "column_decltype")]
-    pub fn columns(&self) -> impl DoubleEndedIterator<Item = Column<'_>> + ExactSizeIterator {
+    pub fn columns(&self) -> impl DoubleEndedIterator<Item = Column> + ExactSizeIterator {
         ColumnsIter::new(self, |s, i| Column {
             name: s.column_name_unwrap(i),
             decl_type: s.stmt.column_decltype(i).map(|s| {
                 s.to_str()
                     .expect("Invalid UTF-8 sequence in column declaration")
+                    .to_owned()
             }),
         })
     }
@@ -217,20 +202,23 @@ impl Statement<'_> {
     #[cfg(feature = "column_metadata")]
     pub fn columns_with_metadata(
         &self,
-    ) -> impl DoubleEndedIterator<Item = ColumnMetadata<'_>> + ExactSizeIterator {
+    ) -> impl DoubleEndedIterator<Item = ColumnMetadata> + ExactSizeIterator {
         ColumnsIter::new(self, |s, i| ColumnMetadata {
             name: s.column_name_unwrap(i),
             database_name: s.stmt.column_database_name(i).map(|s| {
                 s.to_str()
                     .expect("Invalid UTF-8 sequence in column db name")
+                    .to_owned()
             }),
             table_name: s.stmt.column_table_name(i).map(|s| {
                 s.to_str()
                     .expect("Invalid UTF-8 sequence in column table name")
+                    .to_owned()
             }),
             origin_name: s.stmt.column_origin_name(i).map(|s| {
                 s.to_str()
                     .expect("Invalid UTF-8 sequence in column origin name")
+                    .to_owned()
             }),
         })
     }
@@ -255,29 +243,35 @@ impl Statement<'_> {
         col: usize,
     ) -> Result<
         Option<(
-            &CStr,
-            &CStr,
-            &CStr,
-            Option<&CStr>,
-            Option<&CStr>,
+            CString,
+            CString,
+            CString,
+            Option<CString>,
+            Option<CString>,
             bool,
             bool,
             bool,
         )>,
     > {
-        let db_name = self.stmt.column_database_name(col);
-        let table_name = self.stmt.column_table_name(col);
-        let origin_name = self.stmt.column_origin_name(col);
-        if db_name.is_none() || table_name.is_none() || origin_name.is_none() {
+        let Some(db_name) = self.stmt.column_database_name(col).map(CStr::to_owned) else {
             return Ok(None);
-        }
-        let (data_type, coll_seq, not_null, primary_key, auto_inc) =
-            self.conn
-                .column_metadata(db_name, table_name.unwrap(), origin_name.unwrap())?;
+        };
+        let Some(table_name) = self.stmt.column_table_name(col).map(CStr::to_owned) else {
+            return Ok(None);
+        };
+        let Some(origin_name) = self.stmt.column_origin_name(col).map(CStr::to_owned) else {
+            return Ok(None);
+        };
+
+        let (data_type, coll_seq, not_null, primary_key, auto_inc) = self.conn.column_metadata(
+            Some(db_name.as_c_str()),
+            table_name.as_c_str(),
+            origin_name.as_c_str(),
+        )?;
         Ok(Some((
-            db_name.unwrap(),
-            table_name.unwrap(),
-            origin_name.unwrap(),
+            db_name,
+            table_name,
+            origin_name,
             data_type,
             coll_seq,
             not_null,
@@ -345,7 +339,7 @@ impl Connection {
         db_name: Option<N>,
         table_name: N,
         column_name: N,
-    ) -> Result<(Option<&CStr>, Option<&CStr>, bool, bool, bool)> {
+    ) -> Result<(Option<CString>, Option<CString>, bool, bool, bool)> {
         let cs = db_name.as_ref().map(N::as_cstr).transpose()?;
         let db_name = cs.as_ref().map_or(ptr::null(), |s| s.as_ptr());
         let table_name = table_name.as_cstr()?;
@@ -375,12 +369,14 @@ impl Connection {
             if data_type.is_null() {
                 None
             } else {
-                Some(unsafe { CStr::from_ptr(data_type) })
+                // SQLite keeps this pointer only until the next SQLite API call.
+                Some(unsafe { CStr::from_ptr(data_type) }.to_owned())
             },
             if coll_seq.is_null() {
                 None
             } else {
-                Some(unsafe { CStr::from_ptr(coll_seq) })
+                // No SQLite API call has occurred since the metadata lookup.
+                Some(unsafe { CStr::from_ptr(coll_seq) }.to_owned())
             },
             not_null != 0,
             primary_key != 0,
@@ -567,15 +563,10 @@ mod test {
         Ok(())
     }
 
-    /// `column_name` reference should stay valid until `stmt` is reprepared (or
-    /// reset) even if DB schema is altered (SQLite documentation is
-    /// ambiguous here because it says reference "is valid until (...) the next
-    /// call to `sqlite3_column_name()` or `sqlite3_column_name16()` on the same
-    /// column.". We assume that reference is valid if only
-    /// `sqlite3_column_name()` is used):
+    /// Column names still describe the prepared statement after a schema change.
     #[test]
     #[cfg(feature = "modern_sqlite")]
-    fn test_column_name_reference() -> Result<()> {
+    fn test_column_name_after_schema_change() -> Result<()> {
         let db = Connection::open_in_memory()?;
         db.execute_batch("CREATE TABLE y (x);")?;
         let stmt = db.prepare("SELECT x FROM y;")?;
@@ -595,11 +586,11 @@ mod test {
         let query = db.prepare("SELECT *, 1 FROM sqlite_master")?;
         let (db_name, table_name, col_name, data_type, coll_seq, not_null, primary_key, auto_inc) =
             query.column_metadata(0)?.unwrap();
-        assert_eq!(db_name, crate::MAIN_DB);
-        assert_eq!(table_name, c"sqlite_master");
-        assert_eq!(col_name, c"type");
-        assert_eq!(data_type, Some(c"TEXT"));
-        assert_eq!(coll_seq, Some(c"BINARY"));
+        assert_eq!(db_name.as_c_str(), crate::MAIN_DB);
+        assert_eq!(table_name.as_c_str(), c"sqlite_master");
+        assert_eq!(col_name.as_c_str(), c"type");
+        assert_eq!(data_type.as_deref(), Some(c"TEXT"));
+        assert_eq!(coll_seq.as_deref(), Some(c"BINARY"));
         assert!(!not_null);
         assert!(!primary_key);
         assert!(!auto_inc);
@@ -634,7 +625,7 @@ mod test {
             data_type.map(|cs| cs.to_str().unwrap().to_ascii_uppercase()),
             Some("TEXT".to_owned())
         );
-        assert_eq!(coll_seq, Some(c"BINARY"));
+        assert_eq!(coll_seq.as_deref(), Some(c"BINARY"));
         assert!(!not_null);
         assert!(!primary_key);
         assert!(!auto_inc);

@@ -1152,7 +1152,7 @@ impl Connection {
     ///         &cs,
     ///         None::<fn(&str) -> bool>,
     ///         |_, item| {
-    ///           CSI.with_borrow_mut(|c| c.replace(item));
+    ///           CSI.with_borrow_mut(|c| c.replace(&item));
     ///           ConflictAction::SQLITE_CHANGESET_OMIT
     ///         },
     ///     )?;

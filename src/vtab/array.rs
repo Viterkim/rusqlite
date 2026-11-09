@@ -10,13 +10,13 @@
 //!
 //! ```rust,no_run
 //! # use rusqlite::{types::Value, Connection, Result, params};
-//! # use std::rc::Rc;
+//! # use std::sync::Arc;
 //! fn example(db: &Connection) -> Result<()> {
 //!     // Note: This should be done once (usually when opening the DB).
 //!     rusqlite::vtab::array::load_module(&db)?;
 //!     let v = [1i64, 2, 3, 4];
-//!     // Note: A `Rc<Vec<Value>>` must be used as the parameter.
-//!     let values = Rc::new(v.iter().copied().map(Value::from).collect::<Vec<Value>>());
+//!     // Note: An `Arc<Vec<Value>>` must be used as the parameter.
+//!     let values = Arc::new(v.iter().copied().map(Value::from).collect::<Vec<Value>>());
 //!     let mut stmt = db.prepare("SELECT value from rarray(?1);")?;
 //!     let rows = stmt.query_map([values], |row| row.get::<_, i64>(0))?;
 //!     for value in rows {
@@ -29,7 +29,7 @@
 use std::borrow::Cow;
 use std::ffi::{CStr, c_int};
 use std::marker::PhantomData;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ffi;
 use crate::types::{ToSql, ToSqlOutput, Value};
@@ -44,12 +44,13 @@ const ARRAY_TYPE: &CStr = c"rarray";
 const MODULE_NAME: &CStr = ARRAY_TYPE;
 
 /// Array parameter / pointer
-pub type Array = Rc<Vec<Value>>;
+pub type Array = Arc<Vec<Value>>;
 
 impl ToSql for Array {
     #[inline]
     fn to_sql(&self) -> Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::from_rc(self.clone(), ARRAY_TYPE))
+        // The rarray module reads this tag as an Arc<Vec<Value>>.
+        Ok(unsafe { ToSqlOutput::from_arc(Arc::new(self.clone()), ARRAY_TYPE) })
     }
 }
 
@@ -143,13 +144,13 @@ struct ArrayTabCursor<'vtab> {
     /// The rowid
     row_id: i64,
     /// Pointer to the array of values ("pointer")
-    ptr: Option<&'vtab Vec<Value>>,
+    ptr: Option<Arc<Vec<Value>>>,
     phantom: PhantomData<&'vtab ArrayTab>,
 }
 
 impl ArrayTabCursor<'_> {
     fn len(&self) -> i64 {
-        match self.ptr {
+        match &self.ptr {
             Some(a) => a.len() as i64,
             _ => 0,
         }
@@ -158,7 +159,9 @@ impl ArrayTabCursor<'_> {
 unsafe impl VTabCursor for ArrayTabCursor<'_> {
     fn filter(&mut self, idx_num: c_int, _idx_str: Option<&str>, args: &Filters<'_>) -> Result<()> {
         if idx_num > 0 {
-            self.ptr = unsafe { args.get_pointer(0, ARRAY_TYPE) };
+            // The rarray tag points to an Arc<Vec<Value>>. Clone it so the data
+            // stays alive after SQLite's filter arguments have gone away.
+            self.ptr = unsafe { args.get_pointer::<Arc<Vec<Value>>>(0, ARRAY_TYPE) }.cloned();
         } else {
             self.ptr = None;
         }
@@ -179,7 +182,7 @@ unsafe impl VTabCursor for ArrayTabCursor<'_> {
         match i {
             CARRAY_COLUMN_POINTER => Ok(()),
             _ => {
-                if let Some(array) = self.ptr {
+                if let Some(array) = &self.ptr {
                     let value = &array[(self.row_id - 1) as usize];
                     ctx.set_result(value)
                 } else {
@@ -202,7 +205,7 @@ mod test {
     use crate::types::Value;
     use crate::vtab::array;
     use crate::{Connection, Result};
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     #[test]
     fn test_array_module() -> Result<()> {
@@ -211,12 +214,12 @@ mod test {
 
         let v = vec![1i64, 2, 3, 4];
         let values: Vec<Value> = v.into_iter().map(Value::from).collect();
-        let ptr = Rc::new(values);
+        let ptr = Arc::new(values);
         {
             let mut stmt = db.prepare("SELECT value from rarray(?1);")?;
 
             let rows = stmt.query_map([&ptr], |row| row.get::<_, i64>(0))?;
-            assert_eq!(2, Rc::strong_count(&ptr));
+            assert_eq!(2, Arc::strong_count(&ptr));
             let mut count = 0;
             for (i, value) in rows.enumerate() {
                 assert_eq!(i as i64, value? - 1);
@@ -224,7 +227,7 @@ mod test {
             }
             assert_eq!(4, count);
         }
-        assert_eq!(1, Rc::strong_count(&ptr));
+        assert_eq!(1, Arc::strong_count(&ptr));
         Ok(())
     }
 }

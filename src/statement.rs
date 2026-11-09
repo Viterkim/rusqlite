@@ -660,8 +660,9 @@ impl Statement<'_> {
             }
             #[cfg(feature = "pointer")]
             ToSqlOutput::Pointer(p) => {
+                let (pointer, name, release) = p.into_sqlite();
                 unsafe {
-                    ffi::sqlite3_bind_pointer(ptr, ndx as c_int, p.0.cast_mut(), p.1.as_ptr(), p.2)
+                    ffi::sqlite3_bind_pointer(ptr, ndx as c_int, pointer, name.as_ptr(), release)
                 }
             }
         })

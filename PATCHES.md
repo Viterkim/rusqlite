@@ -1,8 +1,6 @@
 # Fork patches
 
-This fork adds query, transaction, and session helpers, plus fixes for conversion errors, callbacks, streaming input, cached statements, library selection, and timestamp parsing. Related changes stay grouped in a few commits on the `fork` branch.
-
-The upstream base is rusqlite/rusqlite commit 84beed6601ec2e261fea83c07834f5d861a9884a. Codec bindings and rarray rowid ordering are already part of that base. The patches here carry forward the earlier `extras` branch and include the streaming reader fix from the Snak vendored copy.
+Based on rusqlite/rusqlite commit 9f59583916e4667f12671150dc42b2b1910433f7, with the earlier `extras` changes and the streaming reader fix from Snak. Codec bindings, rarray rowid ordering, null safe session diff errors, protected raw values, and callback cleanup after client data allocation failure are already upstream.
 
 ## Using the fork
 
@@ -11,47 +9,45 @@ The upstream base is rusqlite/rusqlite commit 84beed6601ec2e261fea83c07834f5d861
 rusqlite = { git = "https://github.com/Viterkim/rusqlite", branch = "fork", features = ["bundled", "session", "buildtime_bindgen"] }
 ```
 
-Use a `rev` instead of `branch` to pin a particular commit. The package version remains 0.41.0, so that number alone does not identify these patches. The normal upstream feature flags still apply. Session additions use `session`, and native session builds need libclang for bindgen.
+Use `rev` to pin a commit. The package version is still 0.41.0, so the version alone does not identify these patches. Upstream feature flags still apply. Session additions need `session`, and native session builds need libclang for bindgen.
 
-The API notes below cover differences from upstream. For the added APIs' generated docs, run:
+The notes below cover changes from upstream. To read the generated API docs:
 
 ```sh
 cargo doc --features "bundled session buildtime_bindgen" --open
 ```
 
-## Shared connection APIs (14ab86f)
+## Shared connection APIs
 
 ### Savepoints
 
-`Connection::unchecked_savepoint` and `unchecked_savepoint_with_name` let code holding a shared connection open a savepoint. `Savepoint::new_unchecked` and `with_name_unchecked` provide the same access through constructors.
+`Connection::unchecked_savepoint` and `unchecked_savepoint_with_name` open savepoints through `&Connection`. The constructors `Savepoint::new_unchecked` and `with_name_unchecked` do the same.
 
-The usual commit and rollback behavior stays the same. Callers must finish overlapping savepoints in reverse order because the shared reference cannot enforce that ordering at compile time.
+Finish overlapping savepoints in reverse order. Commit and rollback work as usual, but the shared reference cannot enforce the ordering.
 
 ### Hooks
 
-`progress_handler` and `authorizer` take `&Connection`. This lets code install those hooks while a session or other shared borrow is alive. Requires the existing `hooks` feature.
+With `hooks`, `progress_handler` and `authorizer` take `&Connection`, so you can install them while a session or another shared borrow is alive.
 
-Changing or removing either hook while one of these callbacks is running returns an error, keeping the running callback alive. Recursive callback entry is rejected before borrowing the closure again.
+Changing or removing a running hook returns an error so its callback stays alive. Recursive entry is rejected before borrowing the closure again.
 
-## Session extensions and safety fixes (4dde5ba)
+## Session extensions and safety fixes
 
-### Diff inference and errors
+### Diff and failed capture
 
-`Session::diff` drops an unused generic parameter that Rust could not infer. Calls such as `session.diff("baseline", "items")` now work directly. Code supplying two explicit generic arguments needs to supply only the name type.
-
-Diff errors also work when SQLite supplies no message, such as an authorizer denying an internal query. These return an error without dereferencing a null pointer.
+`Session::diff` uses upstream's inferred name types and null safe error handling. The fork checks capture before diffing, so a failed capture cannot resume through this call.
 
 ### Changeset size tracking
 
-`Session::set_changeset_size_tracking` enables SQLite's size tracking, and `changeset_size` returns an upper bound on the changeset's byte length. Enable it before attaching tables. Tracking adds overhead while recording changes, and the size is zero when tracking is disabled.
+Enable `Session::set_changeset_size_tracking` before attaching tables. `changeset_size` then returns an upper bound on the changeset's byte length. Tracking adds overhead while recording changes and reports zero when disabled.
 
 ### Session lifetimes and borrowed callbacks
 
-The streaming iterator owns a stable callback context for as long as SQLite can read from it. Moving the iterator keeps that context valid, and the reader stays borrowed until the iterator is dropped.
+Streaming iterators keep their callback context at a stable address when moved and borrow the reader until dropped.
 
 `ChangesetItem` gains a lifetime so a conflict item cannot escape its callback. Apply callbacks accept borrowed `FnMut` closures without `Send` or `'static` bounds, so they can update local state directly. `ChangesetIter::next` is also available without importing the streaming iterator trait.
 
-The streaming constructor changes from `start_strm(&input)` with an extra reference to `start_strm(&mut input)`. Explicit item types become `ChangesetItem<'_>`. Returning or storing an owned conflict item outside its callback is rejected.
+The streaming constructor takes `start_strm(&mut input)` instead of an extra reference through `start_strm(&input)`. Explicit item types become `ChangesetItem<'_>`.
 
 An iteration error clears the current item, so `get` cannot expose a row SQLite has already invalidated.
 
@@ -59,7 +55,7 @@ An iteration error clears the current item, so `get` cannot expose a row SQLite 
 
 `new_value_opt`, `old_value_opt`, and `conflict_value_opt` return `Option<ValueRef>` for values that may be absent. An unchanged column can be absent from an update, which is different from SQL NULL. Invalid operations and column indices still return errors.
 
-`Operation::changeset_operation` returns a typed `ChangesetOperation` with `Insert`, `Update`, and `Delete` variants. `column_count` returns a checked `usize`. The existing accessors remain available.
+`Operation::changeset_operation` returns `ChangesetOperation::{Insert, Update, Delete}`, and `column_count` returns a checked `usize`. The existing accessors remain available.
 
 All column value accessors check that an index fits SQLite's integer range, so a huge index cannot wrap around and read another column.
 
@@ -71,11 +67,11 @@ Reader and writer panics are caught inside the callbacks and returned to SQLite 
 
 ### Filter panic handling
 
-A panicking apply filter now makes the apply return an error. Previously the panic was swallowed and treated as a request to skip the table, so a partial apply could report success.
+An apply filter panic returns an error. Swallowing it as a request to skip the table could let a partial apply report success.
 
-Filtered applies use an outer savepoint to undo earlier changes when the filter panics. `NOSAVEPOINT` disables that protection too, so callers using that flag must handle rollback themselves.
+Filtered applies use an outer savepoint to undo earlier changes after a filter panic. With `NOSAVEPOINT`, you must handle rollback yourself.
 
-A panicking `Session::table_filter` permanently invalidates capture. Changeset and patchset extraction return `Error::SessionCaptureFailure`, including after replacing or removing the filter. Call `Session::check_capture` before using `is_empty` to skip extraction. Create a new session after capture fails.
+A `Session::table_filter` panic permanently invalidates capture. Replacing or removing the filter does not restore it, and changeset and patchset extraction return `Error::SessionCaptureFailure`. Check `Session::check_capture` before using `is_empty` to skip extraction. Failed capture needs a new session.
 
 Reentrant capture filter replacement is rejected by invalidating capture. Dropping a session from its running capture filter intentionally leaks its native session and callback allocation, keeping SQLite's active memory alive.
 
@@ -87,19 +83,17 @@ These methods discard rebase output. SQLite marks the v2 API as experimental.
 
 ### Changeset rebasing
 
-`apply_with_flags_and_rebase` and `apply_strm_with_flags_and_rebase` return optional rebase data from conflict resolution. Feed that data to `Rebaser::configure`, then use `rebase` or `rebase_strm` to adjust local changesets before sending them to peers.
-
-Configure the rebaser in the order the remote changesets were applied. SQLite marks its rebaser API as experimental.
+`apply_with_flags_and_rebase` and `apply_strm_with_flags_and_rebase` return optional rebase data from conflict resolution. Feed it to `Rebaser::configure` in the order the remote changesets were applied, then use `rebase` or `rebase_strm` to adjust local changesets before sending them to peers. SQLite marks this API as experimental.
 
 ### Borrowed changeset bytes
 
-`ChangesetIter::start_bytes` iterates directly over a borrowed byte slice. `Connection::apply_bytes_with_flags` applies one directly with v2 flags, avoiding a streaming reader or an intermediate owned changeset. Iteration keeps the bytes borrowed for the iterator's lifetime, and apply borrows them for the duration of the call.
+`ChangesetIter::start_bytes` iterates over a borrowed byte slice, and `Connection::apply_bytes_with_flags` applies one with v2 flags. Neither needs a streaming reader or an intermediate owned changeset. The bytes stay borrowed until the iterator is dropped or apply returns.
 
 ## Other fixes
 
 ### Cached statements
 
-Bundled native SQLite includes the upstream [535a77cf5a fix](https://github.com/sqlite/sqlite/commit/78793bee814300ff98a48970edfed9189a64f5c6) for repeated statement compilation after clearing bindings. This fixes [rusqlite #1931](https://github.com/rusqlite/rusqlite/issues/1931) while keeping SQLite's optimizations enabled. It applies to this fork's bundled SQLite source, with the reported version still 3.54.1.
+The bundled native SQLite source includes the upstream [535a77cf5a fix](https://github.com/sqlite/sqlite/commit/78793bee814300ff98a48970edfed9189a64f5c6) for repeated statement compilation after clearing bindings ([rusqlite #1931](https://github.com/rusqlite/rusqlite/issues/1931)). SQLite's optimizations stay enabled and its reported version is still 3.54.1.
 
 ### Explicit library directories
 
@@ -109,19 +103,35 @@ Bundled native SQLite includes the upstream [535a77cf5a fix](https://github.com/
 
 Reading an `OffsetDateTime` with the `time` feature returns a conversion error for malformed text, including short strings and Unicode at the date boundary. It no longer panics while looking for a timezone offset.
 
+### Pointer values
+
+Pointer outputs keep owned data alive through cloning and binding, then release it when no longer in use. `ToSqlOutput::from_arc` replaces `from_rc`; `new_boxed` also requires `Send + Sync + 'static` data. Both constructors are unsafe because the SQLite pointer type name must match how its consumers use the data. `from_raw` passes a borrowed pointer without a destructor and requires the data to stay alive through every use.
+
+`vtab::array::Array` is now `Arc<Vec<Value>>` instead of `Rc<Vec<Value>>`, so a connection can release its bindings on another thread.
+
+### Column metadata and busy timeouts
+
+`Connection::column_metadata` and `Statement::column_metadata` return owned `CString` values. SQLite only keeps the type and collation pointers until the next SQLite API call.
+
+`Statement::column_name` returns `String`, and `column_names` yields `String`s. `Column` and `ColumnMetadata` own their strings and no longer take a lifetime parameter. This follows SQLite's documented name lifetime ([#913](https://github.com/rusqlite/rusqlite/issues/913)) and adds copies when requesting names or metadata. Named row lookups still compare names without copying them.
+
+`busy_timeout` returns `Error::BusyTimeoutOutOfRange` when the whole millisecond count exceeds SQLite's limit.
+
+`Filters::in_values` returns owned `Value`s. SQLite invalidates each element when the IN iterator advances. Invalid UTF-8 in a text element returns a conversion error.
+
 ## Query, conversion, and callback errors
 
 ### Query helpers
 
-`Connection::query_all` collects decoded rows. `query_first` reads and decodes only the first row, returning `None` for an empty result. Both accept a normal fallible decoder with any error type, with no required conversion into a rusqlite error.
+`Connection::query_all` collects decoded rows. `query_first` decodes the first row and returns `None` for an empty result. Both accept fallible decoders with any error type, so your decoder errors need no conversion into rusqlite errors.
 
-`QueryError<E>` keeps SQLite failures and decoder failures distinct, retains the SQL, and identifies a failed decoder's result row. The original decoder error stays in its `Decode` variant. Both helpers use the statement cache when the `cache` feature is enabled.
+`QueryError<E>` retains the SQL and keeps the original decoder error in `Decode`, with its result row index. SQLite failures use `Sql`. Both helpers use the statement cache with `cache` enabled.
 
 `Decode::finish_error` retains any statement completion failure alongside the decoder error. The usual `query_row` and `query_one` helpers preserve simultaneous failures in `Error::StatementCompletionFailure`. The legacy `query_row_and_then` returns decoder errors directly as `E`, so use `query_first` when both failures must survive.
 
-The new query, transaction, and fallible apply helpers accept any callback error value. Their error wrappers implement `std::error::Error` when that value does. Containers such as `anyhow::Error`, boxed trait objects, and er trees need explicit variant handling to recover their original errors. These APIs do not add a dependency on any error crate or automatically bridge its reporting system.
+Query, transaction, and fallible apply helpers accept any callback error value. Their wrappers implement `std::error::Error` when that value does. Recover errors held in `anyhow::Error`, boxed trait objects, or er trees by matching the wrapper variants. The helpers have no error crate dependency or automatic bridge to those reporting systems.
 
-For existing rusqlite decoders, `execute_cached`, `query_row_cached`, and `query_one_cached` provide cached versions of the usual connection helpers. Ordinary `execute` and `query_row` keep their existing preparation behavior.
+`execute_cached`, `query_row_cached`, and `query_one_cached` provide cached versions of the usual connection helpers for existing rusqlite decoders. Ordinary `execute` and `query_row` keep their preparation behavior.
 
 First row helpers check statement completion before reporting success. A write with `RETURNING` can produce a row and then fail to commit, and that failure is now returned. Manual row iteration can use `Rows::finish` to check completion without reading the remaining rows.
 
@@ -131,9 +141,9 @@ First row helpers check statement completion before reporting success. A write w
 
 ### Column context
 
-`Row::get` conversion errors now use `Error::ColumnConversionFailure`. Its `ColumnError` records the column index, name, stored SQLite type, requested Rust type, and original conversion error. The original parser error remains reachable through the standard source chain.
+`Row::get` conversion errors use `Error::ColumnConversionFailure`. Its `ColumnError` records the column index, name, stored SQLite type, requested Rust type, and original conversion error. Parser errors remain reachable through the standard source chain.
 
-Code matching the old conversion variants from `Row::get` should inspect `ColumnError::source` instead. Column name and index lookup errors are unchanged. Conversions outside a row use `Error::ValueConversionFailure`, so missing context is no longer represented by a fake column index or SQL NULL type.
+Code matching the old conversion variants from `Row::get` should inspect `ColumnError::source`. Column name and index lookup errors are unchanged. Conversions outside a row use `Error::ValueConversionFailure`, without a fake column index or SQL NULL type.
 
 `types::from_sql_try` reads an existing SQL representation and applies `TryFrom`, simplifying validated newtypes. `FromSqlError::other` also accepts an existing boxed error without boxing it again.
 
@@ -147,7 +157,7 @@ Oversized column, database, and virtual table constraint indices cannot wrap aro
 
 Streaming operations retain their original I/O errors in `Error::SessionIoFailure`, including failures encountered after starting a streaming iterator. The SQLite error code is retained too.
 
-`Connection::apply_bytes_try` accepts a conflict callback returning `Result<ConflictAction, E>`. A callback error aborts the apply and returns the original value alongside SQLite's outcome in `SessionApplyError<E>`. The callback error can be any type.
+`Connection::apply_bytes_try` accepts a conflict callback returning `Result<ConflictAction, E>`. A callback error aborts apply and keeps the original error alongside SQLite's outcome in `SessionApplyError<E>`.
 
 `Error::SessionApplyFailure` retains the original apply error, streaming I/O error, filter panic, rollback attempt, cleanup failures, and final autocommit state when filter or cleanup failures occur. A failed rollback skips release. Cleanup failures no longer overwrite the original failure.
 
@@ -159,15 +169,15 @@ Commit hook panics veto the commit, and progress handler panics interrupt the op
 
 ### Scoped transactions and savepoints
 
-`Connection::with_transaction` runs a fallible operation with the requested transaction behavior, including `Immediate`. `with_savepoint` supports nested operations through a shared connection. Both accept any callback error type. `TransactionError<E>` preserves the original failure, rollback and release failures, and the final autocommit state. A failed rollback skips savepoint release so cleanup cannot accidentally commit the failed operation.
+`Connection::with_transaction` runs a fallible operation with the requested transaction behavior, including `Immediate`. Use `with_savepoint` for nested operations through a shared connection. `TransactionError<E>` keeps the original error, rollback and release failures, and final autocommit state. A failed rollback skips savepoint release so cleanup cannot accidentally commit the failed operation.
 
 Transaction callbacks now receive `&Transaction`, which dereferences to `Connection` and allows helpers to require a transaction in their signatures. Explicit callbacks expecting `&Connection` need a closure or an updated signature.
 
-`with_transaction_decision` and `with_savepoint_decision` let the callback return `TransactionDecision::Commit(value)` or `Rollback(value)`. A rollback can return a normal domain result, such as rejected replay conflicts. Both decisions check cleanup before returning the value. For savepoints, `Commit` releases the savepoint and `Rollback` rolls back then releases it. The savepoint decision callback receives `&Savepoint`. The existing scope helpers delegate to these same completion paths.
+`with_transaction_decision` and `with_savepoint_decision` let the callback return `TransactionDecision::Commit(value)` or `Rollback(value)`. A rollback can return a normal domain result, such as rejected replay conflicts. Both decisions return the value only after cleanup succeeds. For savepoints, `Commit` releases the savepoint and `Rollback` rolls back then releases it. The savepoint callback receives `&Savepoint`. The existing scope helpers use the same completion paths.
 
 `TransactionError::rollback_attempted` distinguishes a successful rollback from skipped cleanup. `with_rollback_savepoint` always rolls back, including on callback success, and returns the callback's value only after rollback and release succeed. Cleanup failure after a successful callback uses `TransactionFailure::Cleanup`.
 
-Explicit transaction and savepoint `finish` calls retain a failed commit error even when rollback succeeds. They no longer make a second hidden cleanup attempt through Drop after reporting their result.
+Explicit transaction and savepoint `finish` calls keep a failed commit error even when rollback succeeds, without another hidden cleanup attempt through Drop.
 
 ### Encryption methods
 
@@ -175,15 +185,15 @@ With the `codec` feature, `Connection::set_key` and `rekey` provide distinct met
 
 ## File opening and connection settings
 
-`Connection::open_file` and `open_file_with_flags` treat their paths as literal filenames, including names beginning with `file:` or equal to `:memory:`. They resolve relative paths before opening so SQLite's global URI setting cannot reinterpret them. Use `open` for URI names or `open_in_memory` for an in-memory database.
+`Connection::open_file` and `open_file_with_flags` open literal filenames, including names beginning with `file:` or equal to `:memory:`. Relative paths are resolved first so SQLite's global URI setting cannot reinterpret them. Use `open` for URI names or `open_in_memory` for an in-memory database.
 
 `set_foreign_keys`, `set_trusted_schema`, `set_journal_mode`, and `set_synchronous` verify that the requested setting is active. Journal and synchronization modes use `JournalMode` and `Synchronous`. An ignored request returns `Error::PragmaValueMismatch` with the requested and actual values. Journal and synchronization setters apply to the main database.
 
 ## Backup cancellation
 
-`Backup::run_to_completion_with` accepts a borrowed `FnMut` callback returning any error type. The callback receives `StepResult` and progress, so it can cancel or stop retrying busy databases. `BackupError<E>` retains callback errors unchanged. The callback also runs after `Done`, when the backup has already completed. Nonpositive page counts return an error from both completion helpers.
+`Backup::run_to_completion_with` accepts a borrowed `FnMut` callback returning any error type. It receives `StepResult` and progress, so it can cancel or stop retrying busy databases. `BackupError<E>` keeps the callback error unchanged. The callback runs after `Done` too, when the backup is already complete. Both completion helpers reject nonpositive page counts.
 
-`run_to_completion_checked` adds a fallible check before the first and every subsequent step, with progress reporting afterward. This supports cancellation before copying any more pages.
+`run_to_completion_checked` runs a fallible check before every step, including the first, and reports progress afterward. A failed check stops it before copying more pages.
 
 ## Schema and connection metadata
 

@@ -122,6 +122,9 @@ pub enum Error {
     /// present in the SQL.
     InvalidParameterName(String),
 
+    /// The busy timeout exceeds SQLite's signed millisecond limit.
+    BusyTimeoutOutOfRange(std::time::Duration),
+
     /// Error converting a file path to a string.
     InvalidPath(PathBuf),
 
@@ -241,6 +244,7 @@ impl PartialEq for Error {
             (Self::Utf8Error(i1, e1), Self::Utf8Error(i2, e2)) => i1 == i2 && e1 == e2,
             (Self::NulError(e1), Self::NulError(e2)) => e1 == e2,
             (Self::InvalidParameterName(n1), Self::InvalidParameterName(n2)) => n1 == n2,
+            (Self::BusyTimeoutOutOfRange(a), Self::BusyTimeoutOutOfRange(b)) => a == b,
             (Self::InvalidPath(p1), Self::InvalidPath(p2)) => p1 == p2,
             (Self::PragmaValueMismatch(a), Self::PragmaValueMismatch(b)) => a == b,
             (Self::ExecuteReturnedResults, Self::ExecuteReturnedResults) => true,
@@ -369,6 +373,11 @@ impl fmt::Display for Error {
             }
             Self::NulError(ref err) => err.fmt(f),
             Self::InvalidParameterName(ref name) => write!(f, "Invalid parameter name: {name}"),
+            Self::BusyTimeoutOutOfRange(timeout) => write!(
+                f,
+                "Busy timeout {timeout:?} exceeds {} milliseconds",
+                i32::MAX
+            ),
             Self::InvalidPath(ref p) => write!(f, "Invalid path: {}", p.to_string_lossy()),
             Self::PathResolutionFailure(ref path, ref source) => {
                 write!(f, "Could not resolve database path {path:?}: {source}")
@@ -454,6 +463,7 @@ impl error::Error for Error {
             Self::IntegralValueOutOfRange(..)
             | Self::SqliteSingleThreadedMode
             | Self::InvalidParameterName(_)
+            | Self::BusyTimeoutOutOfRange(_)
             | Self::ExecuteReturnedResults
             | Self::QueryReturnedNoRows
             | Self::QueryReturnedMoreThanOneRow

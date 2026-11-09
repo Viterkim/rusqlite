@@ -26,46 +26,53 @@ pub enum ToSqlOutput<'a> {
 
     /// Pointer passing interface
     #[cfg(feature = "pointer")]
-    Pointer(
-        (
-            *const std::ffi::c_void,
-            &'static std::ffi::CStr,
-            crate::ffi::sqlite3_destructor_type,
-        ),
-    ),
+    Pointer(super::SqlPointer),
 }
 
 #[cfg(feature = "pointer")]
 impl<'a> ToSqlOutput<'a> {
-    /// Pass an `Rc` as a raw pointer to SQLite
+    /// Pass shared data as a pointer to SQLite.
     ///
-    /// # Warning
-    /// Leak memory if an error happens before the returned pointer is bound to an SQLite statement.
-    pub fn from_rc<T>(rc: std::rc::Rc<T>, ptr_type: &'static std::ffi::CStr) -> ToSqlOutput<'a> {
-        unsafe extern "C" fn free_rc<T>(p: *mut std::ffi::c_void) {
-            unsafe {
-                std::rc::Rc::decrement_strong_count(p.cast::<T>());
-            }
-        }
-        ToSqlOutput::Pointer((
-            std::rc::Rc::into_raw(rc).cast::<std::ffi::c_void>(),
-            ptr_type,
-            Some(free_rc::<T>),
-        ))
+    /// # Safety
+    /// Every SQLite consumer of `ptr_type` must expect `T`, follow its pointer
+    /// ownership protocol, and respect Rust's aliasing and threading rules.
+    /// It must not mutate `T` except through permitted interior mutability.
+    pub unsafe fn from_arc<T: Send + Sync + 'static>(
+        value: std::sync::Arc<T>,
+        ptr_type: &'static std::ffi::CStr,
+    ) -> ToSqlOutput<'a> {
+        ToSqlOutput::Pointer(super::SqlPointer::from_arc(value, ptr_type))
     }
 
-    /// Pass a `Box` as a raw pointer to SQLite
+    /// Pass owned data as a pointer to SQLite.
     ///
-    /// # Warning
-    /// Leak memory if an error happens before the returned pointer is bound to an SQLite statement.
-    pub fn new_boxed<T>(v: T, ptr_type: &'static std::ffi::CStr) -> ToSqlOutput<'a> {
-        use crate::util::free_boxed_value;
+    /// # Safety
+    /// Every SQLite consumer of `ptr_type` must expect `T`, follow its pointer
+    /// ownership protocol, and respect Rust's aliasing and threading rules.
+    /// It must not mutate `T` except through permitted interior mutability.
+    pub unsafe fn new_boxed<T: Send + Sync + 'static>(
+        value: T,
+        ptr_type: &'static std::ffi::CStr,
+    ) -> ToSqlOutput<'a> {
+        // The caller guarantees that SQLite's consumers use this type safely.
+        unsafe { Self::from_arc(std::sync::Arc::new(value), ptr_type) }
+    }
 
-        ToSqlOutput::Pointer((
-            Box::into_raw(Box::new(v)).cast::<std::ffi::c_void>(),
-            ptr_type,
-            Some(free_boxed_value::<T>),
-        ))
+    /// Pass a pointer that SQLite does not own.
+    ///
+    /// # Safety
+    /// Every SQLite consumer of `ptr_type` must expect this pointer's type,
+    /// follow its ownership protocol, and respect Rust's aliasing and threading
+    /// rules. The pointer must remain valid for every SQLite use, including after a connection
+    /// moves to another thread. A statement can retain a binding after a query
+    /// ends, and outputs can be cloned or bound more than once. SQLite will
+    /// not free the pointer. An `rarray` pointer must point to a valid
+    /// `Arc<Vec<Value>>`, which the array cursor clones.
+    pub unsafe fn from_raw(
+        pointer: *mut std::ffi::c_void,
+        ptr_type: &'static std::ffi::CStr,
+    ) -> ToSqlOutput<'a> {
+        ToSqlOutput::Pointer(super::SqlPointer::from_raw(pointer, ptr_type))
     }
 }
 
@@ -148,7 +155,7 @@ impl ToSql for ToSqlOutput<'_> {
             #[cfg(feature = "functions")]
             ToSqlOutput::Arg(i) => ToSqlOutput::Arg(i),
             #[cfg(feature = "pointer")]
-            ToSqlOutput::Pointer(p) => ToSqlOutput::Pointer(p),
+            ToSqlOutput::Pointer(ref p) => ToSqlOutput::Pointer(p.clone()),
         })
     }
 }
@@ -612,21 +619,12 @@ mod test {
 
     #[cfg(feature = "pointer")]
     #[test]
-    fn from_rc() {
-        let rc = std::rc::Rc::new("rc".to_owned());
-        if let ToSqlOutput::Pointer((ptr, _, Some(destructor))) = ToSqlOutput::from_rc(rc, c"rc") {
-            unsafe { destructor(ptr.cast_mut()) }
-        }
-    }
-
-    #[cfg(feature = "pointer")]
-    #[test]
-    fn new_boxed() {
-        let data = "box".to_owned();
-        if let ToSqlOutput::Pointer((ptr, _, Some(destructor))) =
-            ToSqlOutput::new_boxed(data, c"box")
-        {
-            unsafe { destructor(ptr.cast_mut()) }
-        }
+    fn from_arc() {
+        let value = std::sync::Arc::new("value".to_owned());
+        // The pointer is never passed to SQLite.
+        let output = unsafe { ToSqlOutput::from_arc(value.clone(), c"value") };
+        assert_eq!(std::sync::Arc::strong_count(&value), 2);
+        drop(output);
+        assert_eq!(std::sync::Arc::strong_count(&value), 1);
     }
 }

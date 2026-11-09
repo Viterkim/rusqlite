@@ -59,9 +59,11 @@ impl Values<'_> {
         self[idx].subtype()
     }
 
-    /// Return raw pointer at `idx`
+    /// Return the pointer at `idx` as a reference.
+    ///
     /// # Safety
-    /// This function is unsafe because it uses raw pointer and cast
+    /// A pointer with this tag must point to a valid `T` for the entire
+    /// lifetime of the returned reference and obey Rust's aliasing rules.
     // `sqlite3_value_type` returns `SQLITE_NULL` for pointer.
     // So it seems not possible to enhance `ValueRef::from_value`.
     #[cfg(feature = "pointer")]
@@ -195,18 +197,16 @@ impl RawValue {
         ValueRef::from(self)
     }
 
-    /// Returns the pointer
+    /// Returns the pointer as a reference.
+    ///
     /// # Safety
-    /// This function is unsafe because it uses raw pointer and cast
+    /// A pointer with this tag must point to a valid `T` for the entire
+    /// lifetime of the returned reference and obey Rust's aliasing rules.
     #[cfg(feature = "pointer")]
     pub unsafe fn get_pointer<'a, T: 'static>(
         &self,
         ptr_type: &'static std::ffi::CStr,
     ) -> Option<&'a T> {
-        debug_assert_eq!(
-            unsafe { ffi::sqlite3_value_type(self.as_ptr()) },
-            ffi::SQLITE_NULL
-        );
         unsafe {
             ffi::sqlite3_value_pointer(self.as_ptr(), ptr_type.as_ptr())
                 .cast::<T>()

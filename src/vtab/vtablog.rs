@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fallible_iterator::FallibleIterator as _;
 
-use crate::types::Type;
+use crate::types::{Type, Value};
 use crate::vtab::{
     Context, CreateVTab, Filters, IndexInfo, Inserts, Module, TransactionVTab, UpdateVTab, Updates,
     VTab, VTabConnection, VTabCursor, VTabKind,
@@ -290,7 +290,7 @@ unsafe impl VTabCursor for VTabLogCursor<'_> {
                 println!(
                     " in_values[{}]: {:?}",
                     i,
-                    args.in_values(i)?.collect::<Vec<ValueRef>>()
+                    args.in_values(i)?.collect::<Vec<Value>>()
                 );
             }
         }

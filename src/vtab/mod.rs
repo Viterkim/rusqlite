@@ -22,7 +22,7 @@ use crate::context::set_result;
 use crate::error::{check, error_from_sqlite_code, to_sqlite_error};
 use crate::ffi;
 pub use crate::ffi::{sqlite3_vtab, sqlite3_vtab_cursor};
-use crate::types::{ToSql, ValueRef};
+use crate::types::{ToSql, Value, ValueRef};
 pub use crate::types::{ValueIter, Values};
 use crate::util::{alloc, free_boxed_value, from_raw_parts, from_raw_parts_mut};
 use crate::{Connection, Error, InnerConnection, Name, Result, str_to_cstring};
@@ -860,7 +860,10 @@ impl<'a> Deref for Filters<'a> {
     }
 }
 impl Filters<'_> {
-    /// Find all elements on the right-hand side of an IN constraint
+    /// Find all elements on the right-hand side of an IN constraint.
+    ///
+    /// Values are copied before SQLite advances to the next element. Invalid
+    /// UTF-8 in a text value returns a conversion error.
     pub fn in_values(&self, idx: usize) -> Result<InValues<'_>> {
         let list = self.args[idx];
         Ok(InValues {
@@ -877,9 +880,9 @@ pub struct InValues<'a> {
     phantom: PhantomData<Filters<'a>>,
     first: bool,
 }
-impl<'a> fallible_iterator::FallibleIterator for InValues<'a> {
+impl fallible_iterator::FallibleIterator for InValues<'_> {
     type Error = Error;
-    type Item = ValueRef<'a>;
+    type Item = Value;
 
     fn next(&mut self) -> Result<Option<Self::Item>> {
         let mut val: *mut sqlite3_value = ptr::null_mut();
@@ -892,7 +895,11 @@ impl<'a> fallible_iterator::FallibleIterator for InValues<'a> {
             }
         };
         match rc {
-            ffi::SQLITE_OK => Ok(Some(unsafe { ValueRef::from_value(val) })),
+            ffi::SQLITE_OK if val.is_null() => Ok(None),
+            // SQLite keeps this value only until the next IN iterator call.
+            ffi::SQLITE_OK => Value::try_from(unsafe { ValueRef::from_value(val) })
+                .map(Some)
+                .map_err(Error::ValueConversionFailure),
             ffi::SQLITE_DONE => Ok(None),
             _ => Err(error_from_sqlite_code(rc, None)),
         }

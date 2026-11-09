@@ -131,9 +131,11 @@ impl Context<'_> {
         self.args.get(idx)
     }
 
-    /// Return raw pointer at `idx`
+    /// Return the pointer at `idx` as a reference.
+    ///
     /// # Safety
-    /// This function is unsafe because it uses raw pointer and cast
+    /// A pointer with this tag must point to a valid `T` for the returned
+    /// reference and obey Rust's aliasing rules.
     #[cfg(feature = "pointer")]
     #[must_use]
     pub unsafe fn get_pointer<T: 'static>(
@@ -1240,20 +1242,22 @@ mod test {
 
     #[test]
     #[cfg(feature = "pointer")]
-    fn test_rc_pointer() -> Result<()> {
+    fn test_arc_pointer() -> Result<()> {
         use crate::types::ToSqlOutput;
         use std::ops::Deref as _;
-        use std::rc::Rc;
+        use std::sync::Arc;
 
         const PTR_TYPE: &std::ffi::CStr = c"my_rust_ptr";
-        let rc = Rc::new(1);
+        let value = Arc::new(1);
         {
-            let ptr = ToSqlOutput::from_rc(rc.clone(), PTR_TYPE);
-            assert_eq!(2, Rc::strong_count(&rc));
+            // Only myfunc reads this tag, as an i32.
+            let ptr = unsafe { ToSqlOutput::from_arc(value.clone(), PTR_TYPE) };
+            assert_eq!(2, Arc::strong_count(&value));
             fn myfunc(ctx: &mut Context<'_>) -> Result<ToSqlOutput<'static>> {
                 let x = unsafe { ctx.get_pointer(0, PTR_TYPE) };
                 assert_eq!(x, Some(&1));
-                Ok(ToSqlOutput::from_rc(Rc::new(*x.unwrap()), PTR_TYPE))
+                // The result is read as an i32 with the same tag.
+                Ok(unsafe { ToSqlOutput::from_arc(Arc::new(*x.unwrap()), PTR_TYPE) })
             }
             let db = Connection::open_in_memory()?;
             db.create_scalar_function("myfunc", 1, FunctionFlags::SQLITE_DETERMINISTIC, myfunc)?;
@@ -1261,9 +1265,9 @@ mod test {
             let result = stmt.query_one([ptr], |r| {
                 unsafe { r.get_pointer::<_, i32>(0, PTR_TYPE) }.map(|opt| opt.cloned())
             })?;
-            assert_eq!(result.unwrap(), *rc.deref());
+            assert_eq!(result.unwrap(), *value.deref());
         }
-        assert_eq!(1, Rc::strong_count(&rc));
+        assert_eq!(1, Arc::strong_count(&value));
         Ok(())
     }
 
@@ -1274,11 +1278,13 @@ mod test {
 
         const PTR_TYPE: &std::ffi::CStr = c"my_rust_ptr";
         let value = 1;
-        let ptr = ToSqlOutput::new_boxed(value, PTR_TYPE);
+        // Only myfunc reads this tag, as an i32.
+        let ptr = unsafe { ToSqlOutput::new_boxed(value, PTR_TYPE) };
         fn myfunc(ctx: &mut Context<'_>) -> Result<ToSqlOutput<'static>> {
             let x = unsafe { ctx.get_pointer(0, PTR_TYPE) };
             assert_eq!(x, Some(&1));
-            Ok(ToSqlOutput::new_boxed(*x.unwrap(), PTR_TYPE))
+            // The result is read as an i32 with the same tag.
+            Ok(unsafe { ToSqlOutput::new_boxed(*x.unwrap(), PTR_TYPE) })
         }
         let db = Connection::open_in_memory()?;
         db.create_scalar_function("myfunc", 1, FunctionFlags::SQLITE_DETERMINISTIC, myfunc)?;
