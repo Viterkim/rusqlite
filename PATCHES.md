@@ -175,6 +175,8 @@ Streaming operations retain their original I/O errors in `Error::SessionIoFailur
 
 Commit hook panics veto the commit, and progress handler panics interrupt the operation. WAL hook panics now return an error too. WAL callbacks run after commit, so their failure does not undo committed data.
 
+Collation comparator panics abort the process. SQLite cannot report a comparison error, and continuing with an invented ordering result can corrupt indexes. Comparators must define a consistent total order.
+
 ### Scoped transactions and savepoints
 
 `Connection::with_transaction` runs a fallible operation with the requested transaction behavior, including `Immediate`. Use `with_savepoint` for nested operations through a shared connection. `TransactionError<E>` keeps the original error, rollback and release failures, and final autocommit state. A failed rollback skips savepoint release so cleanup cannot accidentally commit the failed operation.

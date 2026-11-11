@@ -10,6 +10,10 @@ use crate::{Connection, Error, InnerConnection, Name, Result};
 
 impl Connection {
     /// Add or modify a collation.
+    ///
+    /// The comparator must define a consistent total order. A comparator panic
+    /// aborts the process because SQLite cannot report a comparison error, and
+    /// continuing with an invented result can corrupt indexes.
     #[inline]
     pub fn create_collation<C, N: Name>(&self, collation_name: N, x_compare: C) -> Result<()>
     where
@@ -86,7 +90,7 @@ impl InnerConnection {
                 })
             };
             let Ok(t) = r else {
-                return -1; // FIXME How ?
+                std::process::abort();
             };
 
             match t {
