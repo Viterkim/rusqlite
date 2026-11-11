@@ -3,8 +3,10 @@
 use std::borrow::Cow;
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::marker::PhantomData;
+#[cfg(not(feature = "loadable_extension"))]
 use std::mem;
 use std::panic::catch_unwind;
+#[cfg(not(feature = "loadable_extension"))]
 use std::ptr;
 use std::time::Duration;
 

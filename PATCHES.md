@@ -1,6 +1,6 @@
 # Fork patches
 
-Based on rusqlite/rusqlite commit 9f59583916e4667f12671150dc42b2b1910433f7, with the earlier `extras` changes and the streaming reader fix from Snak. Codec bindings, rarray rowid ordering, null safe session diff errors, protected raw values, and callback cleanup after client data allocation failure are already upstream.
+Based on rusqlite/rusqlite commit 812d63147ebea21c9c3de4db9e556f2e4e9f8161, with the earlier `extras` changes and the streaming reader fix from Snak. Codec bindings, rarray rowid ordering, null safe session diff errors, protected raw values, and callback cleanup after client data allocation failure are already upstream.
 
 ## Using the fork
 
@@ -9,7 +9,7 @@ Based on rusqlite/rusqlite commit 9f59583916e4667f12671150dc42b2b1910433f7, with
 rusqlite = { git = "https://github.com/Viterkim/rusqlite", branch = "fork", features = ["bundled", "session", "buildtime_bindgen"] }
 ```
 
-Use `rev` to pin a commit. The package version is still 0.41.0, so the version alone does not identify these patches. Upstream feature flags still apply. Session additions need `session`, and native session builds need libclang for bindgen.
+Use `rev` to pin a commit. The package version is 0.42.0, so the version alone does not identify these patches. Upstream feature flags still apply. Session additions need `session`, and native session builds need libclang for bindgen.
 
 The notes below cover changes from upstream. To read the generated API docs:
 
