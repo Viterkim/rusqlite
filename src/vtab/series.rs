@@ -173,6 +173,7 @@ struct SeriesTabCursor<'vtab> {
     base: ffi::sqlite3_vtab_cursor,
     /// True to count down rather than up
     is_desc: bool,
+    done: bool,
     /// The rowid
     row_id: i64,
     /// Current value ("value")
@@ -182,7 +183,7 @@ struct SeriesTabCursor<'vtab> {
     /// Maximum value ("stop")
     max_value: i64,
     /// Increment ("step")
-    step: i64,
+    step: u64,
     phantom: PhantomData<&'vtab SeriesTab>,
 }
 
@@ -203,14 +204,10 @@ unsafe impl VTabCursor for SeriesTabCursor<'_> {
             self.max_value = 0xffff_ffff;
         }
         if idx_num.contains(QueryPlanFlags::STEP) {
-            self.step = args.get::<Option<_>>(i)?.unwrap_or_default();
-            if self.step == 0 {
-                self.step = 1;
-            } else if self.step < 0 {
-                self.step = -self.step;
-                if !idx_num.contains(QueryPlanFlags::ASC) {
-                    idx_num |= QueryPlanFlags::DESC;
-                }
+            let step: i64 = args.get::<Option<_>>(i)?.unwrap_or_default();
+            self.step = step.unsigned_abs().max(1);
+            if step < 0 && !idx_num.contains(QueryPlanFlags::ASC) {
+                idx_num |= QueryPlanFlags::DESC;
             }
         } else {
             self.step = 1;
@@ -224,10 +221,14 @@ unsafe impl VTabCursor for SeriesTabCursor<'_> {
             }
         }
         self.is_desc = idx_num.contains(QueryPlanFlags::DESC);
+        self.done = false;
+
         if self.is_desc {
             self.value = self.max_value;
-            if self.step > 0 {
-                self.value -= (self.max_value - self.min_value) % self.step;
+            if self.max_value > self.min_value {
+                let offset = self.max_value.abs_diff(self.min_value) % self.step;
+                // The offset stays within the span, so the result fits in i64.
+                self.value = self.max_value.wrapping_sub_unsigned(offset);
             }
         } else {
             self.value = self.min_value;
@@ -237,17 +238,25 @@ unsafe impl VTabCursor for SeriesTabCursor<'_> {
     }
 
     fn next(&mut self) -> Result<()> {
-        if self.is_desc {
-            self.value -= self.step;
+        let value = if self.is_desc {
+            self.value.checked_sub_unsigned(self.step)
         } else {
-            self.value += self.step;
+            self.value.checked_add_unsigned(self.step)
+        };
+
+        match value {
+            Some(value) => self.value = value,
+            None => self.done = true,
         }
-        self.row_id += 1;
+
+        self.row_id = self.row_id.wrapping_add(1);
         Ok(())
     }
 
     fn eof(&self) -> bool {
-        if self.is_desc {
+        if self.done {
+            true
+        } else if self.is_desc {
             self.value < self.min_value
         } else {
             self.value > self.max_value
@@ -258,7 +267,7 @@ unsafe impl VTabCursor for SeriesTabCursor<'_> {
         let x = match i {
             SERIES_COLUMN_START => self.min_value,
             SERIES_COLUMN_STOP => self.max_value,
-            SERIES_COLUMN_STEP => self.step,
+            SERIES_COLUMN_STEP => self.step as i64,
             _ => self.value,
         };
         ctx.set_result(x)
@@ -329,6 +338,35 @@ mod test {
         let mut s = db.prepare("SELECT * FROM generate_series(NULL) ORDER BY value DESC")?;
         let series: Vec<i32> = s.query([])?.map(|r| r.get(0)).collect()?;
         assert_eq!(empty, series);
+
+        Ok(())
+    }
+
+    #[test]
+    fn bounds() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        series::load_module(&db)?;
+
+        let mut stmt = db.prepare("SELECT value FROM generate_series(?1, ?2, ?3)")?;
+
+        for (start, stop, step, expected) in [
+            (i64::MAX - 1, i64::MAX, 1, vec![i64::MAX - 1, i64::MAX]),
+            (i64::MIN, i64::MIN + 1, -1, vec![i64::MIN + 1, i64::MIN]),
+            (
+                i64::MIN + 1,
+                i64::MAX,
+                i64::MIN + 2,
+                vec![i64::MAX - 2, -1, i64::MIN + 1],
+            ),
+            (0, 0, i64::MIN, vec![0]),
+        ] {
+            let values: Vec<i64> = stmt
+                .query((start, stop, step))?
+                .map(|row| row.get(0))
+                .collect()?;
+
+            assert_eq!(values, expected);
+        }
 
         Ok(())
     }
