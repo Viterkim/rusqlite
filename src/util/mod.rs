@@ -8,6 +8,42 @@ pub(crate) use small_cstr::SmallCString;
 mod sqlite_string;
 pub(crate) use sqlite_string::{SqliteMallocString, alloc};
 
+// Check the tail without preparing it, since PRAGMAs can act during preparation.
+pub(crate) fn sql_is_empty(sql: &[u8]) -> bool {
+    let end = sql.iter().position(|&byte| byte == 0).unwrap_or(sql.len());
+    let mut sql = &sql[..end];
+
+    loop {
+        match sql {
+            [] => return true,
+            [b' ' | b'\t' | b'\n' | b'\r' | b'\x0c', ..] => {
+                // SQLite consumes vertical tabs after another whitespace byte.
+                let end = sql
+                    .iter()
+                    .position(|&byte| !matches!(byte, b' ' | b'\t'..=b'\r'))
+                    .unwrap_or(sql.len());
+                sql = &sql[end..];
+            }
+            [b';', rest @ ..] | [0xef, 0xbb, 0xbf, rest @ ..] => sql = rest,
+            [b'-', b'-', rest @ ..] => {
+                let end = rest
+                    .iter()
+                    .position(|&byte| byte == b'\n')
+                    .unwrap_or(rest.len());
+                sql = &rest[end..];
+            }
+            [b'/', b'*', rest @ ..] if !rest.is_empty() => {
+                let Some(end) = rest.windows(2).position(|bytes| bytes == b"*/") else {
+                    return true;
+                };
+
+                sql = &rest[end + 2..];
+            }
+            _ => return false,
+        }
+    }
+}
+
 pub(crate) unsafe extern "C" fn free_boxed_value<T>(p: *mut std::ffi::c_void) {
     drop(unsafe { Box::from_raw(p.cast::<T>()) });
 }

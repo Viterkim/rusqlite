@@ -854,7 +854,7 @@ impl Connection {
     #[inline]
     pub fn prepare_with_flags(&self, sql: &str, flags: PrepFlags) -> Result<Statement<'_>> {
         let (stmt, tail) = self.db.borrow_mut().prepare(self, sql, flags)?;
-        if tail != 0 && !self.prepare(&sql[tail..])?.stmt.is_null() {
+        if tail != 0 && !util::sql_is_empty(&sql.as_bytes()[tail..]) {
             Err(Error::MultipleStatement)
         } else {
             Ok(stmt)
@@ -1748,6 +1748,19 @@ mod test {
         }
         db.execute("CREATE TABLE t(c); -- bim", [])
             .expect("Tail comment should be ignored");
+    }
+
+    #[test]
+    fn prepare_tail() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.set_foreign_keys(true)?;
+
+        db.prepare("SELECT 1; PRAGMA foreign_keys = OFF")
+            .unwrap_err();
+
+        let enabled: bool = db.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        assert!(enabled);
+        Ok(())
     }
 
     #[test]
